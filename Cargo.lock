@@ -2330,10 +2330,14 @@ name = "webhook-relay"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hex",
+ "hmac",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
+ "subtle",
  "time",
  "tokio",
  "tower",

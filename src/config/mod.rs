@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub admin_basic_user: String,
     pub admin_basic_pass: String,
     pub source_destinations: HashMap<String, String>,
+    pub source_secrets: HashMap<String, String>,
 }
 
 impl AppConfig {
@@ -20,6 +21,11 @@ impl AppConfig {
             Err(env::VarError::NotPresent) => HashMap::new(),
             Err(err) => return Err(Box::new(err)),
         };
+        let source_secrets = match env::var("SOURCE_SECRETS") {
+            Ok(raw) => serde_json::from_str(&raw)?,
+            Err(env::VarError::NotPresent) => HashMap::new(),
+            Err(err) => return Err(Box::new(err)),
+        };
 
         Ok(Self {
             database_url,
@@ -27,6 +33,7 @@ impl AppConfig {
             admin_basic_user,
             admin_basic_pass,
             source_destinations,
+            source_secrets,
         })
     }
 }
