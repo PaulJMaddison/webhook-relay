@@ -16,9 +16,15 @@ use uuid::Uuid;
 
 use crate::errors::AppError;
 
-pub fn router(pool: PgPool, admin_basic_user: String, admin_basic_pass: String) -> Router {
+pub fn router(
+    pool: PgPool,
+    admin_basic_user: String,
+    admin_basic_pass: String,
+    source_destinations: HashMap<String, String>,
+) -> Router {
     let state = AppState {
         store: Arc::new(PgEventStore { pool }),
+        source_destinations,
     };
 
     router_with_state(state, admin_basic_user, admin_basic_pass)
@@ -42,7 +48,8 @@ fn router_with_state(
 
     let events_routes = Router::new()
         .route("/events", get(events_index))
-        .route("/events/*rest", get(events_index))
+        .route("/events/:id/replay", post(replay_event))
+        .route("/events/:id", get(events_index))
         .layer(middleware::from_fn_with_state(
             admin_auth,
             basic_auth_middleware,
@@ -58,6 +65,7 @@ fn router_with_state(
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn EventStore>,
+    source_destinations: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +103,26 @@ struct StoredEvent {
     received_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone)]
+struct ReplayEvent {
+    id: Uuid,
+    source: String,
+    method: String,
+    body: Vec<u8>,
+    content_type: Option<String>,
+}
+
+#[derive(Debug)]
+struct NewDeliveryAttempt {
+    event_id: Uuid,
+    destination: String,
+    response_status: Option<i32>,
+    response_headers: Option<serde_json::Value>,
+    response_body: Option<Vec<u8>>,
+    error: Option<String>,
+    duration_ms: i32,
+}
+
 #[derive(Clone)]
 struct PgEventStore {
     pool: PgPool,
@@ -104,6 +132,9 @@ struct PgEventStore {
 trait EventStore: Send + Sync {
     async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError>;
     async fn list_events(&self, filters: EventListFilters) -> Result<Vec<ListedEvent>, AppError>;
+    async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError>;
+    async fn create_delivery_attempt(&self, attempt: NewDeliveryAttempt) -> Result<(), AppError>;
+    async fn update_event_status(&self, event_id: Uuid, status: &str) -> Result<(), AppError>;
 }
 
 #[axum::async_trait]
@@ -159,6 +190,173 @@ impl EventStore for PgEventStore {
 
         Ok(events)
     }
+
+    async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError> {
+        let event = sqlx::query_as::<_, ReplayEvent>(
+            r#"
+            SELECT id, source, method, body, content_type
+            FROM events
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(event)
+    }
+
+    async fn create_delivery_attempt(&self, attempt: NewDeliveryAttempt) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            INSERT INTO delivery_attempts (
+                event_id,
+                destination,
+                response_status,
+                response_headers,
+                response_body,
+                error,
+                duration_ms
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(attempt.event_id)
+        .bind(attempt.destination)
+        .bind(attempt.response_status)
+        .bind(attempt.response_headers)
+        .bind(attempt.response_body)
+        .bind(attempt.error)
+        .bind(attempt.duration_ms)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn update_event_status(&self, event_id: Uuid, status: &str) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            UPDATE events
+            SET status = $1
+            WHERE id = $2
+            "#,
+        )
+        .bind(status)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayResponse {
+    event_id: Uuid,
+    status: String,
+}
+
+async fn replay_event(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let event = state
+        .store
+        .load_event_for_replay(id)
+        .await?
+        .ok_or_else(|| AppError {
+            message: format!("event not found: {id}"),
+        })?;
+
+    let destination = state
+        .source_destinations
+        .get(&event.source)
+        .cloned()
+        .ok_or_else(|| AppError {
+            message: format!("no destination configured for source: {}", event.source),
+        })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .no_proxy()
+        .build()
+        .map_err(|err| AppError {
+            message: err.to_string(),
+        })?;
+
+    let started_at = std::time::Instant::now();
+    let method = event
+        .method
+        .parse::<reqwest::Method>()
+        .map_err(|err| AppError {
+            message: err.to_string(),
+        })?;
+
+    let mut request = client
+        .request(method, destination.clone())
+        .header("X-Webhook-Replay", "true")
+        .header("X-Original-Event-Id", event.id.to_string())
+        .body(event.body.clone());
+
+    if let Some(content_type) = &event.content_type {
+        request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+
+    let (status, attempt) = match request.send().await {
+        Ok(response) => {
+            let response_status = i32::from(response.status().as_u16());
+            let headers = headers_to_json_value(response.headers());
+            let body = response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|err| AppError {
+                    message: err.to_string(),
+                })?;
+            let status = if response_status >= 200 && response_status < 300 {
+                "delivered"
+            } else {
+                "failed"
+            };
+
+            (
+                status,
+                NewDeliveryAttempt {
+                    event_id: event.id,
+                    destination,
+                    response_status: Some(response_status),
+                    response_headers: Some(headers),
+                    response_body: Some(body),
+                    error: None,
+                    duration_ms: started_at.elapsed().as_millis() as i32,
+                },
+            )
+        }
+        Err(err) => (
+            "failed",
+            NewDeliveryAttempt {
+                event_id: event.id,
+                destination,
+                response_status: None,
+                response_headers: None,
+                response_body: None,
+                error: Some(err.to_string()),
+                duration_ms: started_at.elapsed().as_millis() as i32,
+            },
+        ),
+    };
+
+    state.store.create_delivery_attempt(attempt).await?;
+    state.store.update_event_status(event.id, status).await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ReplayResponse {
+            event_id: event.id,
+            status: status.to_owned(),
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -425,6 +623,21 @@ fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+fn headers_to_json_value(headers: &reqwest::header::HeaderMap) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for name in headers.keys() {
+        let values = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        out.insert(name.to_string(), serde_json::json!(values));
+    }
+
+    serde_json::Value::Object(out)
+}
+
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for StoredEvent {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
@@ -446,6 +659,20 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ListedEvent {
             source: row.try_get("source")?,
             status: row.try_get("status")?,
             received_at: row.try_get("received_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReplayEvent {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+
+        Ok(Self {
+            id: row.try_get("id")?,
+            source: row.try_get("source")?,
+            method: row.try_get("method")?,
+            body: row.try_get("body")?,
+            content_type: row.try_get("content_type")?,
         })
     }
 }
@@ -472,6 +699,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct MemoryStore {
         events: Arc<RwLock<Vec<NewEvent>>>,
+        attempts: Arc<RwLock<Vec<NewDeliveryAttempt>>>,
+        statuses: Arc<RwLock<HashMap<Uuid, String>>>,
     }
 
     #[axum::async_trait]
@@ -536,6 +765,77 @@ mod tests {
             items.truncate(usize::from(filters.limit) + 1);
             Ok(items)
         }
+
+        async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError> {
+            let event = self
+                .events
+                .read()
+                .await
+                .iter()
+                .find(|event| event.id == id)
+                .map(|event| ReplayEvent {
+                    id: event.id,
+                    source: event.source.clone(),
+                    method: event.method.clone(),
+                    body: event.body.clone(),
+                    content_type: event.content_type.clone(),
+                });
+
+            Ok(event)
+        }
+
+        async fn create_delivery_attempt(
+            &self,
+            attempt: NewDeliveryAttempt,
+        ) -> Result<(), AppError> {
+            self.attempts.write().await.push(attempt);
+            Ok(())
+        }
+
+        async fn update_event_status(&self, event_id: Uuid, status: &str) -> Result<(), AppError> {
+            self.statuses
+                .write()
+                .await
+                .insert(event_id, status.to_owned());
+            Ok(())
+        }
+    }
+
+    async fn spawn_test_receiver() -> (String, tokio::sync::oneshot::Receiver<(HeaderMap, Vec<u8>)>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local addr");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+
+        let app = Router::new().route(
+            "/",
+            post({
+                let tx = tx.clone();
+                move |headers: HeaderMap, body: Bytes| {
+                    let tx = tx.clone();
+                    async move {
+                        if let Some(tx) = tx.lock().await.take() {
+                            let _ = tx.send((headers, body.to_vec()));
+                        }
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test receiver should serve");
+        });
+
+        (format!("http://{addr}/"), rx)
     }
 
     #[tokio::test]
@@ -544,6 +844,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -588,6 +889,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -620,6 +922,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
+                source_destinations: HashMap::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -652,6 +955,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -677,6 +981,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
+                source_destinations: HashMap::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -703,6 +1008,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -735,5 +1041,87 @@ mod tests {
             .expect("request should succeed");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn replay_forwards_exact_body_and_content_type() {
+        let (destination, received) = spawn_test_receiver().await;
+        let mut destinations = HashMap::new();
+        destinations.insert("stripe".to_owned(), destination);
+
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: destinations,
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let payload = br#"{"type":"invoice.paid","ok":true}"#.to_vec();
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.clone()))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("ingest request should succeed");
+
+        assert_eq!(ingest_response.status(), StatusCode::CREATED);
+
+        let event_id = store.events.read().await[0].id;
+        let replay_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/events/{event_id}/replay"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("replay request should succeed");
+
+        assert_eq!(replay_response.status(), StatusCode::OK);
+
+        let (headers, body) = tokio::time::timeout(std::time::Duration::from_secs(2), received)
+            .await
+            .expect("receiver should be called")
+            .expect("receiver should capture replay");
+        assert_eq!(body, payload);
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers
+                .get("x-webhook-replay")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            headers
+                .get("x-original-event-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(event_id.to_string().as_str())
+        );
+
+        let attempts = store.attempts.read().await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].response_status, Some(200));
+
+        let statuses = store.statuses.read().await;
+        assert_eq!(
+            statuses.get(&event_id).map(String::as_str),
+            Some("delivered")
+        );
     }
 }

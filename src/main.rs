@@ -20,7 +20,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting webhook-relay"
     );
 
-    let app = api::router(pool, config.admin_basic_user, config.admin_basic_pass);
+    let app = api::router(
+        pool,
+        config.admin_basic_user,
+        config.admin_basic_pass,
+        config.source_destinations,
+    );
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(address = %config.bind_addr, "server listening");
 
