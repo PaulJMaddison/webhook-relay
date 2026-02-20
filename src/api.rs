@@ -509,7 +509,7 @@ async fn replay_event(
             apply_forwarded_headers(request, &original_headers, &state.replay_forward_headers);
 
         let attempt_id = Uuid::new_v4();
-        let (status, attempt) = match request.send().await {
+        let (status, attempt, should_retry) = match request.send().await {
             Ok(response) => {
                 let response_status = i32::from(response.status().as_u16());
                 let headers = headers_to_json_value(response.headers());
@@ -536,6 +536,7 @@ async fn replay_event(
                         error: None,
                         duration_ms: started_at.elapsed().as_millis() as i32,
                     },
+                    (500..600).contains(&response_status),
                 )
             }
             Err(err) => (
@@ -550,6 +551,7 @@ async fn replay_event(
                     error: Some(err.to_string()),
                     duration_ms: started_at.elapsed().as_millis() as i32,
                 },
+                true,
             ),
         };
 
@@ -563,6 +565,7 @@ async fn replay_event(
 
         final_status = match status {
             EventStatus::Delivered => EventStatus::Delivered,
+            EventStatus::Failed if !should_retry => EventStatus::Dead,
             EventStatus::Failed if attempt_idx + 1 == max_attempts => EventStatus::Dead,
             _ => EventStatus::Failed,
         };
@@ -576,7 +579,7 @@ async fn replay_event(
             "replay attempt finished"
         );
 
-        if status == EventStatus::Delivered {
+        if status == EventStatus::Delivered || !should_retry {
             break;
         }
 
@@ -1392,6 +1395,40 @@ mod tests {
                         };
                         let _ = tx.send(status);
                         status
+                    }
+                }
+            }),
+        );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test receiver should serve");
+        });
+
+        (format!("http://{addr}/"), rx)
+    }
+
+    async fn spawn_client_error_receiver(
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<StatusCode>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local addr");
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = Router::new().route(
+            "/",
+            post({
+                let tx = tx.clone();
+                move || {
+                    let tx = tx.clone();
+                    async move {
+                        let _ = tx.send(StatusCode::BAD_REQUEST);
+                        StatusCode::BAD_REQUEST
                     }
                 }
             }),
@@ -2455,6 +2492,93 @@ mod tests {
             statuses.get(&event_id).copied(),
             Some(EventStatus::Delivered)
         );
+    }
+
+    #[tokio::test]
+    async fn replay_does_not_retry_on_4xx_response() {
+        let (destination, mut statuses) = spawn_client_error_receiver().await;
+        let mut destinations = HashMap::new();
+        destinations.insert(
+            "stripe".to_owned(),
+            SourceConfig {
+                url: destination,
+                timeout_ms: 10_000,
+            },
+        );
+
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_configs: destinations,
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("ingest request should succeed");
+
+        assert_eq!(ingest_response.status(), StatusCode::CREATED);
+
+        let event_id = store.events.read().await[0].event.id;
+        let replay_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/events/{event_id}/replay?retries=2"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("replay request should succeed");
+
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(replay_response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(
+            payload.get("final_status").and_then(Value::as_str),
+            Some("dead")
+        );
+        let attempts = payload
+            .get("attempts")
+            .and_then(Value::as_array)
+            .expect("attempts should be an array");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].get("response_status").and_then(Value::as_i64),
+            Some(400)
+        );
+
+        let only_status = tokio::time::timeout(std::time::Duration::from_secs(2), statuses.recv())
+            .await
+            .expect("first attempt should complete")
+            .expect("channel should stay open");
+        assert_eq!(only_status, StatusCode::BAD_REQUEST);
+        assert!(statuses.try_recv().is_err());
+
+        let attempts = store.attempts.read().await;
+        assert_eq!(attempts.len(), 1);
+
+        let statuses = store.statuses.read().await;
+        assert_eq!(statuses.get(&event_id).copied(), Some(EventStatus::Dead));
     }
 
     #[tokio::test]
