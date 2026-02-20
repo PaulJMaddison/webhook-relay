@@ -147,6 +147,7 @@ struct IngestResponse {
 struct NewEvent {
     id: Uuid,
     source: String,
+    idempotency_key: Option<String>,
     method: String,
     path: String,
     query: Option<String>,
@@ -161,6 +162,12 @@ struct StoredEvent {
     id: Uuid,
     source: String,
     received_at: OffsetDateTime,
+}
+
+#[derive(Debug)]
+struct CreateEventResult {
+    event: StoredEvent,
+    created: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -191,7 +198,7 @@ struct PgEventStore {
 
 #[axum::async_trait]
 trait EventStore: Send + Sync {
-    async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError>;
+    async fn create_event(&self, event: NewEvent) -> Result<CreateEventResult, AppError>;
     async fn list_events(&self, filters: EventListFilters) -> Result<Vec<ListedEvent>, AppError>;
     async fn get_event(&self, id: Uuid) -> Result<Option<ListedEvent>, AppError>;
     async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError>;
@@ -205,10 +212,80 @@ trait EventStore: Send + Sync {
 
 #[axum::async_trait]
 impl EventStore for PgEventStore {
-    async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError> {
+    async fn create_event(&self, event: NewEvent) -> Result<CreateEventResult, AppError> {
+        if let Some(idempotency_key) = event.idempotency_key {
+            let inserted = sqlx::query_as::<_, StoredEvent>(
+                r#"
+                INSERT INTO events (
+                    id,
+                    source,
+                    idempotency_key,
+                    method,
+                    path,
+                    query,
+                    headers,
+                    body,
+                    body_size_bytes,
+                    content_type
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (source, idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                DO NOTHING
+                RETURNING id, source, received_at
+                "#,
+            )
+            .bind(event.id)
+            .bind(&event.source)
+            .bind(&idempotency_key)
+            .bind(event.method)
+            .bind(event.path)
+            .bind(event.query)
+            .bind(event.headers)
+            .bind(event.body)
+            .bind(event.body_size_bytes)
+            .bind(event.content_type)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some(stored) = inserted {
+                return Ok(CreateEventResult {
+                    event: stored,
+                    created: true,
+                });
+            }
+
+            let existing = sqlx::query_as::<_, StoredEvent>(
+                r#"
+                SELECT id, source, received_at
+                FROM events
+                WHERE source = $1 AND idempotency_key = $2
+                "#,
+            )
+            .bind(event.source)
+            .bind(idempotency_key)
+            .fetch_one(&self.pool)
+            .await?;
+
+            return Ok(CreateEventResult {
+                event: existing,
+                created: false,
+            });
+        }
+
         let stored = sqlx::query_as::<_, StoredEvent>(
             r#"
-            INSERT INTO events (id, source, method, path, query, headers, body, body_size_bytes, content_type)
+            INSERT INTO events (
+                id,
+                source,
+                method,
+                path,
+                query,
+                headers,
+                body,
+                body_size_bytes,
+                content_type
+            )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, source, received_at
             "#,
@@ -225,7 +302,10 @@ impl EventStore for PgEventStore {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(stored)
+        Ok(CreateEventResult {
+            event: stored,
+            created: true,
+        })
     }
 
     async fn list_events(&self, filters: EventListFilters) -> Result<Vec<ListedEvent>, AppError> {
@@ -732,6 +812,10 @@ async fn ingest_hook(
     validate_source_signature(&source, &state.source_secrets, &headers, &body)?;
 
     let event_id = Uuid::new_v4();
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
     let path = uri.path().to_owned();
     let query = uri.query().map(ToOwned::to_owned);
     let content_type = headers
@@ -742,6 +826,7 @@ async fn ingest_hook(
     let event = NewEvent {
         id: event_id,
         source,
+        idempotency_key,
         method: method.to_string(),
         path,
         query,
@@ -752,7 +837,8 @@ async fn ingest_hook(
         content_type,
     };
 
-    let stored = state.store.create_event(event).await?;
+    let create_result = state.store.create_event(event).await?;
+    let stored = create_result.event;
 
     tracing::info!(request_id = %request_id.0, event_id = %stored.id, source = %stored.source, "event ingested");
 
@@ -768,7 +854,13 @@ async fn ingest_hook(
         HeaderValue::from_str(&stored.id.to_string()).expect("valid UUID header value"),
     );
 
-    Ok((StatusCode::CREATED, response_headers, Json(response)))
+    let status = if create_result.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+
+    Ok((status, response_headers, Json(response)))
 }
 
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
@@ -902,6 +994,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for NewEvent {
         Ok(Self {
             id: row.try_get("id")?,
             source: row.try_get("source")?,
+            idempotency_key: row.try_get("idempotency_key")?,
             method: row.try_get("method")?,
             path: row.try_get("path")?,
             query: row.try_get("query")?,
@@ -986,36 +1079,36 @@ mod tests {
 
     #[axum::async_trait]
     impl EventStore for MemoryStore {
-        async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError> {
+        async fn create_event(&self, event: NewEvent) -> Result<CreateEventResult, AppError> {
+            if let Some(idempotency_key) = event.idempotency_key.as_ref() {
+                if let Some(existing) = self.events.read().await.iter().find(|stored| {
+                    stored.event.source == event.source
+                        && stored.event.idempotency_key.as_deref() == Some(idempotency_key)
+                }) {
+                    return Ok(CreateEventResult {
+                        event: StoredEvent {
+                            id: existing.event.id,
+                            source: existing.event.source.clone(),
+                            received_at: existing.received_at,
+                        },
+                        created: false,
+                    });
+                }
+            }
+
             let received_at = OffsetDateTime::now_utc();
             self.events.write().await.push(StoredMemoryEvent {
                 received_at,
-                event: NewEvent {
-                    id: event.id,
-                    source: event.source.clone(),
-                    method: event.method,
-                    path: event.path,
-                    query: event.query,
-                    headers: event.headers,
-                    body: event.body,
-                    content_type: event.content_type,
-                },
-            self.events.write().await.push(NewEvent {
-                id: event.id,
-                source: event.source.clone(),
-                method: event.method,
-                path: event.path,
-                query: event.query,
-                headers: event.headers,
-                body: event.body,
-                body_size_bytes: event.body_size_bytes,
-                content_type: event.content_type,
+                event: event.clone(),
             });
 
-            Ok(StoredEvent {
-                id: event.id,
-                source: event.source,
-                received_at,
+            Ok(CreateEventResult {
+                event: StoredEvent {
+                    id: event.id,
+                    source: event.source,
+                    received_at,
+                },
+                created: true,
             })
         }
 
@@ -1035,13 +1128,9 @@ mod tests {
                 .map(|event| ListedEvent {
                     id: event.event.id,
                     source: event.event.source.clone(),
-                    status: "received".to_owned(),
-                    received_at: event.received_at,
-                    id: event.id,
-                    source: event.source.clone(),
                     status: EventStatus::Received,
-                    received_at: OffsetDateTime::now_utc(),
-                    body_size_bytes: event.body_size_bytes,
+                    received_at: event.received_at,
+                    body_size_bytes: event.event.body_size_bytes,
                 })
                 .collect::<Vec<_>>();
 
@@ -1072,17 +1161,13 @@ mod tests {
                 .read()
                 .await
                 .iter()
-                .find(|event| event.id == id)
+                .find(|event| event.event.id == id)
                 .map(|event| ListedEvent {
-                    id: event.id,
-                    source: event.source.clone(),
-                    method: event.method.clone(),
-                    headers: event.headers.clone(),
-                    body: event.body.clone(),
-                    content_type: event.content_type.clone(),
-                    status: "received".to_owned(),
-                    received_at: OffsetDateTime::now_utc(),
-                    body_size_bytes: event.body_size_bytes,
+                    id: event.event.id,
+                    source: event.event.source.clone(),
+                    status: EventStatus::Received,
+                    received_at: event.received_at,
+                    body_size_bytes: event.event.body_size_bytes,
                 });
 
             Ok(event)
@@ -1099,6 +1184,7 @@ mod tests {
                     id: event.event.id,
                     source: event.event.source.clone(),
                     method: event.event.method.clone(),
+                    headers: event.event.headers.clone(),
                     body: event.event.body.clone(),
                     content_type: event.event.content_type.clone(),
                 });
@@ -1271,12 +1357,10 @@ mod tests {
         assert_eq!(stored[0].event.path, "/hooks/stripe");
         assert_eq!(stored[0].event.query.as_deref(), Some("attempt=1"));
         assert_eq!(stored[0].event.body, payload);
-        assert_eq!(stored[0].source, "stripe");
-        assert_eq!(stored[0].method, "POST");
-        assert_eq!(stored[0].path, "/hooks/stripe");
-        assert_eq!(stored[0].query.as_deref(), Some("attempt=1"));
-        assert_eq!(stored[0].body, payload);
-        assert_eq!(stored[0].body_size_bytes as usize, stored[0].body.len());
+        assert_eq!(
+            stored[0].event.body_size_bytes as usize,
+            stored[0].event.body.len()
+        );
 
         let sig_headers = stored[0]
             .event
@@ -1323,9 +1407,102 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].event.source, "github");
         assert_eq!(stored[0].event.body, payload);
-        assert_eq!(stored[0].source, "github");
-        assert_eq!(stored[0].body, payload);
-        assert_eq!(stored[0].body_size_bytes as usize, stored[0].body.len());
+    }
+
+    #[tokio::test]
+    async fn ingest_with_idempotency_key_first_insert_returns_created() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/github")
+                    .header("Idempotency-Key", "dedupe-1")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(store.events.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_with_idempotency_key_duplicate_returns_existing_event_id() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/github")
+                    .header("Idempotency-Key", "dedupe-1")
+                    .body(Body::from("{\"first\":true}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(first_response.status(), StatusCode::CREATED);
+        let first_payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("body should be valid json");
+
+        let second_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/github")
+                    .header("Idempotency-Key", "dedupe-1")
+                    .body(Body::from("{\"first\":false}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second_payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(second_response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable"),
+        )
+        .expect("body should be valid json");
+
+        assert_eq!(
+            second_payload.get("id").and_then(Value::as_str),
+            first_payload.get("id").and_then(Value::as_str)
+        );
+        assert_eq!(store.events.read().await.len(), 1);
     }
 
     #[tokio::test]
@@ -1755,6 +1932,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1814,6 +1992,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -2033,7 +2212,7 @@ mod tests {
 
         assert_eq!(ingest_response.status(), StatusCode::CREATED);
 
-        let event_id = store.events.read().await[0].id;
+        let event_id = store.events.read().await[0].event.id;
         let replay_response = app
             .oneshot(
                 Request::builder()
@@ -2110,7 +2289,7 @@ mod tests {
 
         assert_eq!(ingest_response.status(), StatusCode::CREATED);
 
-        let event_id = store.events.read().await[0].id;
+        let event_id = store.events.read().await[0].event.id;
         let replay_response = app
             .oneshot(
                 Request::builder()
@@ -2147,16 +2326,13 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
                 max_webhook_size_bytes: 1024,
-                max_webhook_size_bytes: 5_242_880,
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
             1024,
-            5_242_880,
         );
 
         let response = app
