@@ -1,16 +1,8 @@
-use async_trait::async_trait;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 
-use crate::{
-    domain::{NewEvent, StoredEvent},
-    errors::AppError,
-};
-
-pub mod memory;
-pub mod pg;
-
-#[async_trait]
-pub trait EventStore: Send + Sync {
-    async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError>;
-    async fn list_events(&self) -> Result<Vec<StoredEvent>, AppError>;
-    async fn get_event(&self, id: uuid::Uuid) -> Result<StoredEvent, AppError>;
+pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await
 }
