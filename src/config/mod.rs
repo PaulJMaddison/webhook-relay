@@ -1,16 +1,28 @@
+use std::{collections::HashMap, env, error::Error};
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub database_url: String,
     pub bind_addr: String,
+    pub admin_basic_user: String,
+    pub admin_basic_pass: String,
+    pub source_destinations: HashMap<String, String>,
 }
 
 impl AppConfig {
-    pub fn from_env() -> Result<Self, std::env::VarError> {
-        let database_url = std::env::var("DATABASE_URL")?;
-        let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let database_url = env::var("DATABASE_URL")?;
+        let bind_addr = env::var("BIND_ADDR")?;
+        let admin_basic_user = env::var("ADMIN_BASIC_USER")?;
+        let admin_basic_pass = env::var("ADMIN_BASIC_PASS")?;
+        let source_destinations = serde_json::from_str(&env::var("SOURCE_DESTINATIONS")?)?;
+
         Ok(Self {
             database_url,
             bind_addr,
+            admin_basic_user,
+            admin_basic_pass,
+            source_destinations,
         })
     }
 }

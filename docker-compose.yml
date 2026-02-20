@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16
+    container_name: webhook-relay-postgres
     environment:
       POSTGRES_USER: webhook
       POSTGRES_PASSWORD: webhook
@@ -11,21 +12,9 @@ services:
       test: ["CMD-SHELL", "pg_isready -U webhook -d webhook_relay"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
     volumes:
       - pgdata:/var/lib/postgresql/data
-
-  api:
-    build: .
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgres://webhook:webhook@postgres:5432/webhook_relay
-      BIND_ADDR: 0.0.0.0:8080
-      RUST_LOG: info
-    ports:
-      - "8080:8080"
 
 volumes:
   pgdata:
