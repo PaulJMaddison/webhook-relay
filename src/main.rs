@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.source_destinations,
         config.source_secrets,
         config.max_webhook_size_bytes,
+        config.replay_forward_headers,
     );
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(address = %config.bind_addr, "server listening");
