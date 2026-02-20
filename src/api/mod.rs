@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::errors::AppError;
+use crate::{domain::EventStatus, errors::AppError};
 
 pub fn router(
     pool: PgPool,
@@ -192,7 +192,11 @@ trait EventStore: Send + Sync {
     async fn get_event(&self, id: Uuid) -> Result<Option<ListedEvent>, AppError>;
     async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError>;
     async fn create_delivery_attempt(&self, attempt: NewDeliveryAttempt) -> Result<(), AppError>;
-    async fn update_event_status(&self, event_id: Uuid, status: &str) -> Result<(), AppError>;
+    async fn update_event_status(
+        &self,
+        event_id: Uuid,
+        status: EventStatus,
+    ) -> Result<(), AppError>;
 }
 
 #[axum::async_trait]
@@ -226,7 +230,7 @@ impl EventStore for PgEventStore {
             SELECT id, source, status, received_at, body_size_bytes
             FROM events
             WHERE ($1::text IS NULL OR source = $1)
-              AND ($2::text IS NULL OR status = $2)
+              AND ($2::event_status IS NULL OR status = $2)
               AND ($3::timestamptz IS NULL OR received_at >= $3)
               AND ($4::timestamptz IS NULL OR received_at <= $4)
               AND (
@@ -308,7 +312,11 @@ impl EventStore for PgEventStore {
         Ok(())
     }
 
-    async fn update_event_status(&self, event_id: Uuid, status: &str) -> Result<(), AppError> {
+    async fn update_event_status(
+        &self,
+        event_id: Uuid,
+        status: EventStatus,
+    ) -> Result<(), AppError> {
         sqlx::query(
             r#"
             UPDATE events
@@ -328,7 +336,7 @@ impl EventStore for PgEventStore {
 #[derive(Debug, Serialize)]
 struct ReplayResponse {
     event_id: Uuid,
-    status: String,
+    status: EventStatus,
 }
 
 async fn replay_event(
@@ -382,9 +390,9 @@ async fn replay_event(
                 .map(|bytes| bytes.to_vec())
                 .map_err(|err| AppError::upstream(err.to_string()))?;
             let status = if response_status >= 200 && response_status < 300 {
-                "delivered"
+                EventStatus::Delivered
             } else {
-                "failed"
+                EventStatus::Failed
             };
 
             (
@@ -401,7 +409,7 @@ async fn replay_event(
             )
         }
         Err(err) => (
-            "failed",
+            EventStatus::Failed,
             NewDeliveryAttempt {
                 event_id: event.id,
                 destination,
@@ -417,13 +425,13 @@ async fn replay_event(
     state.store.create_delivery_attempt(attempt).await?;
     state.store.update_event_status(event.id, status).await?;
 
-    tracing::info!(request_id = %request_id.0, event_id = %event.id, status, "replay finished");
+    tracing::info!(request_id = %request_id.0, event_id = %event.id, status = ?status, "replay finished");
 
     Ok((
         StatusCode::OK,
         Json(ReplayResponse {
             event_id: event.id,
-            status: status.to_owned(),
+            status,
         }),
     ))
 }
@@ -431,7 +439,7 @@ async fn replay_event(
 #[derive(Debug, Deserialize)]
 struct EventListQuery {
     source: Option<String>,
-    status: Option<String>,
+    status: Option<EventStatus>,
     since: Option<OffsetDateTime>,
     until: Option<OffsetDateTime>,
     limit: Option<u16>,
@@ -441,7 +449,7 @@ struct EventListQuery {
 #[derive(Debug, Clone)]
 struct EventListFilters {
     source: Option<String>,
-    status: Option<String>,
+    status: Option<EventStatus>,
     since: Option<OffsetDateTime>,
     until: Option<OffsetDateTime>,
     cursor_received_at: Option<OffsetDateTime>,
@@ -453,7 +461,7 @@ struct EventListFilters {
 struct ListedEvent {
     id: Uuid,
     source: String,
-    status: String,
+    status: EventStatus,
     received_at: OffsetDateTime,
     body_size_bytes: i32,
 }
@@ -865,7 +873,7 @@ mod tests {
     struct MemoryStore {
         events: Arc<RwLock<Vec<NewEvent>>>,
         attempts: Arc<RwLock<Vec<NewDeliveryAttempt>>>,
-        statuses: Arc<RwLock<HashMap<Uuid, String>>>,
+        statuses: Arc<RwLock<HashMap<Uuid, EventStatus>>>,
     }
 
     #[axum::async_trait]
@@ -906,7 +914,7 @@ mod tests {
                 .map(|event| ListedEvent {
                     id: event.id,
                     source: event.source.clone(),
-                    status: "received".to_owned(),
+                    status: EventStatus::Received,
                     received_at: OffsetDateTime::now_utc(),
                     body_size_bytes: event.body_size_bytes,
                 })
@@ -977,11 +985,12 @@ mod tests {
             Ok(())
         }
 
-        async fn update_event_status(&self, event_id: Uuid, status: &str) -> Result<(), AppError> {
-            self.statuses
-                .write()
-                .await
-                .insert(event_id, status.to_owned());
+        async fn update_event_status(
+            &self,
+            event_id: Uuid,
+            status: EventStatus,
+        ) -> Result<(), AppError> {
+            self.statuses.write().await.insert(event_id, status);
             Ok(())
         }
     }
@@ -1726,8 +1735,8 @@ mod tests {
 
         let statuses = store.statuses.read().await;
         assert_eq!(
-            statuses.get(&event_id).map(String::as_str),
-            Some("delivered")
+            statuses.get(&event_id).copied(),
+            Some(EventStatus::Delivered)
         );
     }
 
@@ -1739,11 +1748,13 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 1024,
                 max_webhook_size_bytes: 5_242_880,
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            1024,
             5_242_880,
         );
 
