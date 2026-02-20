@@ -175,6 +175,7 @@ struct ReplayEvent {
 
 #[derive(Debug)]
 struct NewDeliveryAttempt {
+    id: Uuid,
     event_id: Uuid,
     destination: String,
     response_status: Option<i32>,
@@ -292,6 +293,7 @@ impl EventStore for PgEventStore {
         sqlx::query(
             r#"
             INSERT INTO delivery_attempts (
+                id,
                 event_id,
                 destination,
                 response_status,
@@ -300,9 +302,10 @@ impl EventStore for PgEventStore {
                 error,
                 duration_ms
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
+        .bind(attempt.id)
         .bind(attempt.event_id)
         .bind(attempt.destination)
         .bind(attempt.response_status)
@@ -368,16 +371,30 @@ async fn replay_event(
         })?;
 
     let started_at = std::time::Instant::now();
+    let attempt_id = Uuid::new_v4();
     let method = event
         .method
         .parse::<reqwest::Method>()
         .map_err(|err| AppError::internal(err.to_string()))?;
+
+    let replay_span = tracing::info_span!(
+        "replay_attempt",
+        request_id = %request_id.0,
+        event_id = %event.id,
+        source = %event.source,
+        destination = %destination,
+        attempt_id = %attempt_id
+    );
+    let _replay_span_guard = replay_span.enter();
+
+    tracing::info!("replay attempt started");
 
     let mut request = state
         .http_client
         .request(method, destination.clone())
         .header("X-Webhook-Replay", "true")
         .header("X-Original-Event-Id", event.id.to_string())
+        .header("X-Request-Id", request_id.0.clone())
         .body(event.body.clone());
 
     if let Some(content_type) = &event.content_type {
@@ -405,6 +422,7 @@ async fn replay_event(
             (
                 status,
                 NewDeliveryAttempt {
+                    id: attempt_id,
                     event_id: event.id,
                     destination,
                     response_status: Some(response_status),
@@ -418,6 +436,7 @@ async fn replay_event(
         Err(err) => (
             EventStatus::Failed,
             NewDeliveryAttempt {
+                id: attempt_id,
                 event_id: event.id,
                 destination,
                 response_status: None,
@@ -429,10 +448,16 @@ async fn replay_event(
         ),
     };
 
+    tracing::info!(
+        status = ?status,
+        response_status = attempt.response_status,
+        duration_ms = attempt.duration_ms,
+        error = attempt.error.as_deref(),
+        "replay attempt finished"
+    );
+
     state.store.create_delivery_attempt(attempt).await?;
     state.store.update_event_status(event.id, status).await?;
-
-    tracing::info!(request_id = %request_id.0, event_id = %event.id, status = ?status, "replay finished");
 
     Ok((
         StatusCode::OK,
@@ -988,33 +1013,17 @@ mod tests {
     impl EventStore for MemoryStore {
         async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError> {
             let received_at = OffsetDateTime::now_utc();
-            self.events.write().await.push(StoredMemoryEvent {
-                received_at,
-                event: NewEvent {
-                    id: event.id,
-                    source: event.source.clone(),
-                    method: event.method,
-                    path: event.path,
-                    query: event.query,
-                    headers: event.headers,
-                    body: event.body,
-                    content_type: event.content_type,
-                },
-            self.events.write().await.push(NewEvent {
-                id: event.id,
-                source: event.source.clone(),
-                method: event.method,
-                path: event.path,
-                query: event.query,
-                headers: event.headers,
-                body: event.body,
-                body_size_bytes: event.body_size_bytes,
-                content_type: event.content_type,
-            });
+            let event_id = event.id;
+            let source = event.source.clone();
+
+            self.events
+                .write()
+                .await
+                .push(StoredMemoryEvent { event, received_at });
 
             Ok(StoredEvent {
-                id: event.id,
-                source: event.source,
+                id: event_id,
+                source,
                 received_at,
             })
         }
@@ -1028,38 +1037,36 @@ mod tests {
                 .read()
                 .await
                 .iter()
-                .filter(|event| match &filters.source {
-                    Some(source) => &event.event.source == source,
-                    None => true,
-                })
-                .map(|event| ListedEvent {
-                    id: event.event.id,
-                    source: event.event.source.clone(),
-                    status: "received".to_owned(),
-                    received_at: event.received_at,
-                    id: event.id,
-                    source: event.source.clone(),
+                .map(|stored| ListedEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
                     status: EventStatus::Received,
-                    received_at: OffsetDateTime::now_utc(),
-                    body_size_bytes: event.body_size_bytes,
+                    received_at: stored.received_at,
+                    body_size_bytes: stored.event.body_size_bytes,
                 })
                 .collect::<Vec<_>>();
 
-            items.sort_by(|a, b| (b.received_at, b.id).cmp(&(a.received_at, a.id)));
-
             if let Some(status) = filters.status {
-                items.retain(|e| e.status == status);
+                items.retain(|event| event.status == status);
+            }
+            if let Some(source) = filters.source {
+                items.retain(|event| event.source == source);
             }
             if let Some(since) = filters.since {
-                items.retain(|e| e.received_at >= since);
+                items.retain(|event| event.received_at >= since);
             }
             if let Some(until) = filters.until {
-                items.retain(|e| e.received_at <= until);
+                items.retain(|event| event.received_at <= until);
             }
+
+            items.sort_by(|a, b| (b.received_at, b.id).cmp(&(a.received_at, a.id)));
+
             if let (Some(cursor_received_at), Some(cursor_id)) =
                 (filters.cursor_received_at, filters.cursor_id)
             {
-                items.retain(|e| (e.received_at, e.id) < (cursor_received_at, cursor_id));
+                items.retain(|event| {
+                    (event.received_at, event.id) < (cursor_received_at, cursor_id)
+                });
             }
 
             items.truncate(usize::from(filters.limit) + 1);
@@ -1067,22 +1074,22 @@ mod tests {
         }
 
         async fn get_event(&self, id: Uuid) -> Result<Option<ListedEvent>, AppError> {
+            let statuses = self.statuses.read().await;
             let event = self
                 .events
                 .read()
                 .await
                 .iter()
-                .find(|event| event.id == id)
-                .map(|event| ListedEvent {
-                    id: event.id,
-                    source: event.source.clone(),
-                    method: event.method.clone(),
-                    headers: event.headers.clone(),
-                    body: event.body.clone(),
-                    content_type: event.content_type.clone(),
-                    status: "received".to_owned(),
-                    received_at: OffsetDateTime::now_utc(),
-                    body_size_bytes: event.body_size_bytes,
+                .find(|stored| stored.event.id == id)
+                .map(|stored| ListedEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
+                    status: statuses
+                        .get(&stored.event.id)
+                        .copied()
+                        .unwrap_or(EventStatus::Received),
+                    received_at: stored.received_at,
+                    body_size_bytes: stored.event.body_size_bytes,
                 });
 
             Ok(event)
@@ -1094,13 +1101,14 @@ mod tests {
                 .read()
                 .await
                 .iter()
-                .find(|event| event.event.id == id)
-                .map(|event| ReplayEvent {
-                    id: event.event.id,
-                    source: event.event.source.clone(),
-                    method: event.event.method.clone(),
-                    body: event.event.body.clone(),
-                    content_type: event.event.content_type.clone(),
+                .find(|stored| stored.event.id == id)
+                .map(|stored| ReplayEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
+                    method: stored.event.method.clone(),
+                    headers: stored.event.headers.clone(),
+                    body: stored.event.body.clone(),
+                    content_type: stored.event.content_type.clone(),
                 });
 
             Ok(event)
@@ -1271,12 +1279,6 @@ mod tests {
         assert_eq!(stored[0].event.path, "/hooks/stripe");
         assert_eq!(stored[0].event.query.as_deref(), Some("attempt=1"));
         assert_eq!(stored[0].event.body, payload);
-        assert_eq!(stored[0].source, "stripe");
-        assert_eq!(stored[0].method, "POST");
-        assert_eq!(stored[0].path, "/hooks/stripe");
-        assert_eq!(stored[0].query.as_deref(), Some("attempt=1"));
-        assert_eq!(stored[0].body, payload);
-        assert_eq!(stored[0].body_size_bytes as usize, stored[0].body.len());
 
         let sig_headers = stored[0]
             .event
@@ -1323,9 +1325,6 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].event.source, "github");
         assert_eq!(stored[0].event.body, payload);
-        assert_eq!(stored[0].source, "github");
-        assert_eq!(stored[0].body, payload);
-        assert_eq!(stored[0].body_size_bytes as usize, stored[0].body.len());
     }
 
     #[tokio::test]
@@ -1629,6 +1628,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/events/{event_id}/replay"))
                     .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .header("x-request-id", "req-replay-1")
                     .body(Body::empty())
                     .expect("valid request"),
             )
@@ -1755,6 +1755,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1814,6 +1815,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1950,6 +1952,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/events/{event_id}/replay"))
                     .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .header("x-request-id", "req-replay-1")
                     .body(Body::empty())
                     .expect("valid request"),
             )
@@ -1982,8 +1985,14 @@ mod tests {
             Some(event_id.to_string().as_str())
         );
 
+        assert_eq!(
+            headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("req-replay-1")
+        );
+
         let attempts = store.attempts.read().await;
         assert_eq!(attempts.len(), 1);
+        assert_ne!(attempts[0].id, Uuid::nil());
         assert_eq!(attempts[0].response_status, Some(200));
 
         let statuses = store.statuses.read().await;
@@ -2033,7 +2042,7 @@ mod tests {
 
         assert_eq!(ingest_response.status(), StatusCode::CREATED);
 
-        let event_id = store.events.read().await[0].id;
+        let event_id = store.events.read().await[0].event.id;
         let replay_response = app
             .oneshot(
                 Request::builder()
@@ -2110,7 +2119,7 @@ mod tests {
 
         assert_eq!(ingest_response.status(), StatusCode::CREATED);
 
-        let event_id = store.events.read().await[0].id;
+        let event_id = store.events.read().await[0].event.id;
         let replay_response = app
             .oneshot(
                 Request::builder()
@@ -2147,16 +2156,13 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                max_webhook_size_bytes: 5_242_880,
-                replay_forward_headers: default_replay_forward_headers(),
                 max_webhook_size_bytes: 1024,
-                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
             1024,
-            5_242_880,
         );
 
         let response = app
