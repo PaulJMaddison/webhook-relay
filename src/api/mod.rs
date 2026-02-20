@@ -1,7 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
 use hmac::{Hmac, Mac};
-use reqwest::Client;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -32,7 +31,6 @@ pub fn router(
         store: Arc::new(PgEventStore { pool }),
         source_destinations,
         source_secrets,
-        http_client: Client::new(),
     };
 
     router_with_state(state, admin_basic_user, admin_basic_pass)
@@ -100,7 +98,6 @@ struct AppState {
     store: Arc<dyn EventStore>,
     source_destinations: HashMap<String, String>,
     source_secrets: HashMap<String, String>,
-    http_client: Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -346,6 +343,11 @@ async fn replay_event(
                 .bytes()
                 .await
                 .map(|bytes| bytes.to_vec())
+                .map_err(|err| AppError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: err.to_string(),
+                })?;
+            let status = if (200..300).contains(&response_status) {
                 .map_err(|err| AppError::upstream(err.to_string()))?;
             let status = if response_status >= 200 && response_status < 300 {
                 "delivered"
@@ -638,6 +640,7 @@ fn validate_source_signature(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ingest_hook(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -941,7 +944,6 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -969,7 +971,6 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1004,7 +1005,6 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1051,7 +1051,6 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1086,7 +1085,6 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1121,7 +1119,6 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1152,7 +1149,6 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets,
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1183,7 +1179,6 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets,
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1217,7 +1212,6 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1246,7 +1240,6 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1337,7 +1330,6 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1384,7 +1376,6 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: destinations,
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
