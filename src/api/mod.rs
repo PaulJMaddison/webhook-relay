@@ -175,6 +175,7 @@ struct ReplayEvent {
 
 #[derive(Debug)]
 struct NewDeliveryAttempt {
+    id: Uuid,
     event_id: Uuid,
     destination: String,
     response_status: Option<i32>,
@@ -292,6 +293,7 @@ impl EventStore for PgEventStore {
         sqlx::query(
             r#"
             INSERT INTO delivery_attempts (
+                id,
                 event_id,
                 destination,
                 response_status,
@@ -300,9 +302,10 @@ impl EventStore for PgEventStore {
                 error,
                 duration_ms
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
+        .bind(attempt.id)
         .bind(attempt.event_id)
         .bind(attempt.destination)
         .bind(attempt.response_status)
@@ -393,6 +396,8 @@ async fn replay_event(
         })?;
 
     let retries = query.retry_count()?;
+    let started_at = std::time::Instant::now();
+    let attempt_id = Uuid::new_v4();
     let method = event
         .method
         .parse::<reqwest::Method>()
@@ -417,6 +422,29 @@ async fn replay_event(
 
         request =
             apply_forwarded_headers(request, &original_headers, &state.replay_forward_headers);
+    let replay_span = tracing::info_span!(
+        "replay_attempt",
+        request_id = %request_id.0,
+        event_id = %event.id,
+        source = %event.source,
+        destination = %destination,
+        attempt_id = %attempt_id
+    );
+    let _replay_span_guard = replay_span.enter();
+
+    tracing::info!("replay attempt started");
+
+    let mut request = state
+        .http_client
+        .request(method, destination.clone())
+        .header("X-Webhook-Replay", "true")
+        .header("X-Original-Event-Id", event.id.to_string())
+        .header("X-Request-Id", request_id.0.clone())
+        .body(event.body.clone());
+
+    if let Some(content_type) = &event.content_type {
+        request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
 
         let attempt = match request.send().await {
             Ok(response) => {
@@ -429,6 +457,7 @@ async fn replay_event(
                     .map_err(|err| AppError::upstream(err.to_string()))?;
 
                 NewDeliveryAttempt {
+                    id: attempt_id,
                     event_id: event.id,
                     destination: destination.clone(),
                     response_status: Some(response_status),
@@ -439,6 +468,13 @@ async fn replay_event(
                 }
             }
             Err(err) => NewDeliveryAttempt {
+                },
+            )
+        }
+        Err(err) => (
+            EventStatus::Failed,
+            NewDeliveryAttempt {
+                id: attempt_id,
                 event_id: event.id,
                 destination: destination.clone(),
                 response_status: None,
@@ -485,6 +521,17 @@ async fn replay_event(
         .await?;
 
     tracing::info!(request_id = %request_id.0, event_id = %event.id, status = ?final_status, "replay finished");
+
+    tracing::info!(
+        status = ?status,
+        response_status = attempt.response_status,
+        duration_ms = attempt.duration_ms,
+        error = attempt.error.as_deref(),
+        "replay attempt finished"
+    );
+
+    state.store.create_delivery_attempt(attempt).await?;
+    state.store.update_event_status(event.id, status).await?;
 
     Ok((
         StatusCode::OK,
@@ -1043,6 +1090,9 @@ mod tests {
             let received_at = OffsetDateTime::now_utc();
             let id = event.id;
             let source = event.source.clone();
+            let event_id = event.id;
+            let source = event.source.clone();
+
             self.events
                 .write()
                 .await
@@ -1050,6 +1100,7 @@ mod tests {
 
             Ok(StoredEvent {
                 id,
+                id: event_id,
                 source,
                 received_at,
             })
@@ -1078,24 +1129,36 @@ mod tests {
                         .unwrap_or(EventStatus::Received),
                     received_at: event.received_at,
                     body_size_bytes: event.event.body_size_bytes,
+                .map(|stored| ListedEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
+                    status: EventStatus::Received,
+                    received_at: stored.received_at,
+                    body_size_bytes: stored.event.body_size_bytes,
                 })
                 .collect::<Vec<_>>();
 
-            items.sort_by(|a, b| (b.received_at, b.id).cmp(&(a.received_at, a.id)));
-
             if let Some(status) = filters.status {
-                items.retain(|e| e.status == status);
+                items.retain(|event| event.status == status);
+            }
+            if let Some(source) = filters.source {
+                items.retain(|event| event.source == source);
             }
             if let Some(since) = filters.since {
-                items.retain(|e| e.received_at >= since);
+                items.retain(|event| event.received_at >= since);
             }
             if let Some(until) = filters.until {
-                items.retain(|e| e.received_at <= until);
+                items.retain(|event| event.received_at <= until);
             }
+
+            items.sort_by(|a, b| (b.received_at, b.id).cmp(&(a.received_at, a.id)));
+
             if let (Some(cursor_received_at), Some(cursor_id)) =
                 (filters.cursor_received_at, filters.cursor_id)
             {
-                items.retain(|e| (e.received_at, e.id) < (cursor_received_at, cursor_id));
+                items.retain(|event| {
+                    (event.received_at, event.id) < (cursor_received_at, cursor_id)
+                });
             }
 
             items.truncate(usize::from(filters.limit) + 1);
@@ -1119,6 +1182,16 @@ mod tests {
                         .unwrap_or(EventStatus::Received),
                     received_at: event.received_at,
                     body_size_bytes: event.event.body_size_bytes,
+                .find(|stored| stored.event.id == id)
+                .map(|stored| ListedEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
+                    status: statuses
+                        .get(&stored.event.id)
+                        .copied()
+                        .unwrap_or(EventStatus::Received),
+                    received_at: stored.received_at,
+                    body_size_bytes: stored.event.body_size_bytes,
                 });
 
             Ok(event)
@@ -1138,6 +1211,14 @@ mod tests {
                     headers: event.event.headers.clone(),
                     body: event.event.body.clone(),
                     content_type: event.event.content_type.clone(),
+                .find(|stored| stored.event.id == id)
+                .map(|stored| ReplayEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
+                    method: stored.event.method.clone(),
+                    headers: stored.event.headers.clone(),
+                    body: stored.event.body.clone(),
+                    content_type: stored.event.content_type.clone(),
                 });
 
             Ok(event)
@@ -1714,6 +1795,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/events/{event_id}/replay"))
                     .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .header("x-request-id", "req-replay-1")
                     .body(Body::empty())
                     .expect("valid request"),
             )
@@ -2037,6 +2119,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/events/{event_id}/replay"))
                     .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .header("x-request-id", "req-replay-1")
                     .body(Body::empty())
                     .expect("valid request"),
             )
@@ -2069,8 +2152,14 @@ mod tests {
             Some(event_id.to_string().as_str())
         );
 
+        assert_eq!(
+            headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("req-replay-1")
+        );
+
         let attempts = store.attempts.read().await;
         assert_eq!(attempts.len(), 1);
+        assert_ne!(attempts[0].id, Uuid::nil());
         assert_eq!(attempts[0].response_status, Some(200));
 
         let statuses = store.statuses.read().await;
