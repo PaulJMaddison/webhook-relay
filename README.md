@@ -1,42 +1,93 @@
 # webhook-relay
 
-`webhook-relay` is a production-oriented Rust service for capturing incoming webhooks, storing the original request, inspecting events through authenticated admin endpoints, and replaying events to preconfigured destinations for debugging, recovery, and downstream system backfills.
+Capture, inspect, and replay real webhooks so your team can debug failures fast and recover safely.
 
-> Package: `webhook-relay` (library crate: `webhook_relay`)  
-> Binary: `webhook-relay` (many teams use the shorthand alias `whrelay` locally)
+**What you get:**
+- Stop guessing why a webhook failed—store the exact request body + metadata for later inspection.
+- Replay real events into staging or recovery workflows after outages, deploys, or downstream incidents.
+- Build a practical webhook audit trail your team owns in Postgres.
+- Reduce “works locally, fails in prod” gaps by developing against real provider payloads.
+- Keep operations predictable with authenticated admin APIs, delivery tracking, and request IDs.
 
-## Features
+**It takes ~60 seconds to start:**
+```bash
+docker compose up -d postgres
+export DATABASE_URL='postgres://webhook:webhook@localhost:5432/webhook_relay' BIND_ADDR='0.0.0.0:8080' ADMIN_BASIC_USER='admin' ADMIN_BASIC_PASS='secret' SOURCE_CONFIGS='{"stripe":{"url":"http://127.0.0.1:3000/webhooks/stripe","timeout_ms":5000}}' SOURCE_SECRETS='{"stripe":"topsecret"}' REPLAY_FORWARD_HEADERS='content-type,user-agent,x-github-event,x-github-delivery,stripe-signature'
+cargo run
+```
 
-- Source-based ingest endpoint: `POST /hooks/:source`
-- Raw payload + metadata persistence in PostgreSQL
-- Optional per-source HMAC-SHA256 signature verification (`X-Signature`)
-- Admin event listing with filters + cursor pagination
-- Event inspection endpoint by id
-- Replay endpoint with configurable header forwarding and retry policy
-- Replay status tracking (`received`, `delivered`, `failed`, `dead`) and delivery attempt records
-- Request ID propagation (`X-Request-Id`) for traceability
-- Automatic SQL migrations at startup
+Docs: [Extending](docs/EXTENDING.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
-## Architecture overview
+---
 
-At a high level:
+## Why webhook-relay?
 
-1. **Ingest**: source system sends a webhook to `POST /hooks/:source`.
-2. **Store**: the raw request body and key metadata are written to PostgreSQL.
-3. **Inspect**: operators use admin endpoints (`/events*`) to list and inspect stored events.
-4. **Replay**: operators replay a stored event to the configured destination for that source.
+If you integrate Stripe, GitHub, Slack, or similar webhook providers, this probably sounds familiar:
 
-## Quickstart (under 10 minutes)
+- A payment/provider event “definitely sent” but never hit your business logic.
+- A temporary 500 during deploy caused retries, partial processing, and hard-to-reproduce states.
+- A bug only appears with real provider payloads/headers—not your mocked fixture.
+- Staging behaves differently from production because real traffic is messy.
+- Signature verification fails and everyone debates whether payload bytes changed in transit.
 
-### Option A: run Postgres with Docker Compose + run app locally
+`webhook-relay` exists to make those incidents diagnosable and recoverable: capture exactly what came in, inspect it later, and replay safely to known destinations.
 
-1. Start PostgreSQL:
+## How it helps (real use-cases)
+
+1. **Replay the exact event that failed in production into staging**  
+   Reproduce a bug with the original payload + key headers before shipping a fix.
+
+2. **Capture and inspect actual provider requests**  
+   Verify real body bytes, delivery IDs, and event headers instead of reverse-engineering from logs.
+
+3. **Build a dead-letter style webhook workflow**  
+   Track failed deliveries, inspect attempts, and replay after downstream fixes.
+
+4. **Develop new consumers against recorded events**  
+   Use real historical events to validate parsing, idempotency, and side effects.
+
+5. **Recover after downtime**  
+   Replay stored events once your service/database is healthy again.
+
+6. **Debug signature confusion quickly**  
+   Compare provider signing expectations against captured raw payload bytes and headers.
+
+## Feature highlights
+
+- Capture raw webhook bytes exactly as received.
+- Inspect stored events through authenticated admin APIs.
+- Replay to configured destinations with safe header forwarding + replay metadata.
+- Track delivery attempts and event status (`received`, `delivered`, `failed`, `dead`).
+- Enforce payload size limits and optional per-source signature verification.
+- Self-hosted, Postgres-backed storage and control.
+- Contributor-friendly Rust layout (modern module style, no `mod.rs`).
+
+## Architecture (one-screen view)
+
+```text
+Webhook Provider
+      |
+      v
+POST /hooks/:source
+      |
+      v
+webhook-relay ---------> Postgres (raw events + attempts)
+      |
+      +---- Admin API (/events, /events/:id, /replay)
+                               |
+                               v
+                     Replay to Destination Service
+```
+
+## Quickstart (practical)
+
+### 1) Start Postgres
 
 ```bash
 docker compose up -d postgres
 ```
 
-2. Export environment variables:
+### 2) Run webhook-relay
 
 ```bash
 export DATABASE_URL='postgres://webhook:webhook@localhost:5432/webhook_relay'
@@ -46,39 +97,10 @@ export ADMIN_BASIC_PASS='secret'
 export SOURCE_CONFIGS='{"stripe":{"url":"http://127.0.0.1:3000/webhooks/stripe","timeout_ms":5000}}'
 export SOURCE_SECRETS='{"stripe":"topsecret"}'
 export REPLAY_FORWARD_HEADERS='content-type,user-agent,x-github-event,x-github-delivery,stripe-signature'
-```
-
-3. Run the service:
-
-```bash
 cargo run
 ```
 
-4. Verify health:
-
-```bash
-curl -s http://127.0.0.1:8080/healthz | jq .
-```
-
-### Option B: run full service in Docker
-
-```bash
-docker build -t webhook-relay:local .
-docker run --rm -p 8080:8080 \
-  -e DATABASE_URL='postgres://webhook:webhook@host.docker.internal:5432/webhook_relay' \
-  -e BIND_ADDR='0.0.0.0:8080' \
-  -e ADMIN_BASIC_USER='admin' \
-  -e ADMIN_BASIC_PASS='secret' \
-  -e SOURCE_CONFIGS='{"stripe":{"url":"http://host.docker.internal:3000/webhooks/stripe","timeout_ms":5000}}' \
-  -e SOURCE_SECRETS='{"stripe":"topsecret"}' \
-  webhook-relay:local
-```
-
-## Example walkthrough
-
-### a) Run a local receiver server
-
-Use a tiny Python receiver that prints webhook requests:
+### 3) Run a local receiver (for replay target)
 
 ```bash
 python - <<'PY'
@@ -88,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('Content-Length', '0'))
         body = self.rfile.read(length)
-        print('\n--- received replay ---')
+        print("\n--- received replay ---")
         print('path:', self.path)
         print('headers:', dict(self.headers))
         print('body:', body.decode('utf-8', errors='replace'))
@@ -100,9 +122,7 @@ HTTPServer(('127.0.0.1', 3000), Handler).serve_forever()
 PY
 ```
 
-### b) Ingest a webhook with curl
-
-If `SOURCE_SECRETS` includes `stripe`, compute signature over the exact raw body:
+### 4) Ingest one webhook and replay it
 
 ```bash
 body='{"type":"invoice.paid","data":{"id":"inv_123"}}'
@@ -113,107 +133,95 @@ curl -i -X POST 'http://127.0.0.1:8080/hooks/stripe?attempt=1' \
   -H "x-signature: sha256=$sig" \
   -H 'x-idempotency-key: demo-evt-1' \
   --data "$body"
-```
 
-Expected: HTTP `201 Created` with event id in JSON.
+curl -s -u admin:secret 'http://127.0.0.1:8080/events?source=stripe&limit=1' | jq .
+# copy the returned id into EVENT_ID
 
-### c) List events (admin auth)
-
-```bash
-curl -s -u admin:secret 'http://127.0.0.1:8080/events?source=stripe&limit=5' | jq .
-```
-
-### d) Inspect one event
-
-```bash
-EVENT_ID='<paste-event-id>'
-curl -s -u admin:secret "http://127.0.0.1:8080/events/$EVENT_ID" | jq .
-```
-
-### e) Replay to the receiver
-
-```bash
 curl -i -X POST -u admin:secret "http://127.0.0.1:8080/events/$EVENT_ID/replay?retries=2"
 ```
 
-Expected:
+Expected receiver output includes:
 
-- HTTP `200 OK`
-- receiver process prints the replayed request
-- event status transitions to `delivered` on success
+```text
+--- received replay ---
+path: /webhooks/stripe
+headers: {...}
+body: {"type":"invoice.paid","data":{"id":"inv_123"}}
+```
+
+## Is this for me?
+
+**Best fit if you need:**
+- A self-hosted webhook relay/audit trail with replay control.
+- Better incident response for webhook-driven systems.
+- Reliable staging/debug workflows based on real events.
+- Straightforward integration into existing Postgres-based infrastructure.
+
+**Probably not a fit if you need:**
+- A fully managed SaaS with no infrastructure ownership.
+- A UI-first webhook operations platform out of the box.
+- Turnkey multi-region HA/DR without additional engineering.
+
+## Alternatives / positioning
+
+- If you want a **hosted webhook operations product**, choose a managed SaaS category tool.
+- If you only need a **temporary request bin**, use a lightweight request-capture/bin tool.
+- If you want a **self-hosted, replayable webhook audit trail** with Postgres ownership, `webhook-relay` is the target use-case.
+
+## Adoption and trust signals
+
+- **Safety defaults:** admin API auth required; payload size limit via `MAX_WEBHOOK_SIZE_BYTES`; replay destinations are server-configured.
+- **Observability:** request ID propagation (`X-Request-Id`) and `tracing` JSON logs.
+- **Data ownership:** all events and delivery attempts stored in your Postgres.
+- **Compatibility:** legacy `SOURCE_DESTINATIONS` remains supported when `SOURCE_CONFIGS` is unset.
 
 ## Configuration reference
 
 ### Required
 
 - `DATABASE_URL`: PostgreSQL DSN.
-- `BIND_ADDR`: bind address (`host:port`), e.g. `0.0.0.0:8080`.
+- `BIND_ADDR`: bind address (`host:port`), for example `0.0.0.0:8080`.
 - `ADMIN_BASIC_USER`: HTTP Basic username for admin endpoints.
 - `ADMIN_BASIC_PASS`: HTTP Basic password for admin endpoints.
 
 ### Optional
 
-- `MAX_WEBHOOK_SIZE_BYTES`: max accepted webhook body size. Default: `5242880` (5 MiB).
+- `MAX_WEBHOOK_SIZE_BYTES`: max accepted webhook body size (default: `5242880`, 5 MiB).
 - `SOURCE_CONFIGS`: JSON map of source → object:
   - `url` (required): replay destination URL.
-  - `timeout_ms` (optional): per-source replay timeout in ms. Default: `10000`.
-  - Example:
-    ```json
-    {
-      "stripe": { "url": "https://internal/stripe/webhook", "timeout_ms": 5000 },
-      "github": { "url": "https://internal/github/webhook" }
-    }
-    ```
+  - `timeout_ms` (optional): replay timeout in ms (default: `10000`).
 - `SOURCE_DESTINATIONS` (legacy/backward compatible): JSON map of source → destination URL. Used only when `SOURCE_CONFIGS` is unset.
 - `SOURCE_SECRETS`: JSON map of source → HMAC secret for ingest signature verification.
-- `REPLAY_FORWARD_HEADERS`: comma-separated lower/any-case header allowlist forwarded from original request during replay.
+- `REPLAY_FORWARD_HEADERS`: comma-separated header allowlist forwarded during replay.
 
 ### Retry behavior
 
-Replay supports `?retries=N` where `N` is the number of *extra* attempts after the first send.
+Replay supports `?retries=N`, where `N` is extra attempts after the first send.
 
-- max supported `N` is `2` (hard cap of 3 total attempts)
-- retries happen for network/5xx style failures
-- 4xx responses are treated as non-retriable
-- when retries are exhausted and delivery still fails, status becomes `dead`
+- Max `N` is `2` (3 total attempts).
+- Retries apply to network/5xx style failures.
+- 4xx responses are non-retriable.
+- After retries are exhausted, status becomes `dead`.
 
 ## Security notes
 
 - Admin endpoints (`/events`, `/events/:id`, `/events/:id/replay`, `/events/:id/reset`) require HTTP Basic auth.
-- Signature verification is **optional per source**: only enforced when `SOURCE_SECRETS[source]` exists.
-- Ingest body size is limited by `MAX_WEBHOOK_SIZE_BYTES`.
-- Replay destination is server-side configuration only (reduces open relay risk).
+- Signature verification is optional per source and enforced only when `SOURCE_SECRETS[source]` exists.
+- Replay destination URLs come from server-side config (not user-supplied request parameters).
 
-## Operations notes
+## Extending webhook-relay
 
-- Logging uses `tracing` JSON output by default.
-- Set log level with `RUST_LOG` (for example `RUST_LOG=webhook_relay=debug`).
-- Every request has an `X-Request-Id` (incoming value preserved or generated UUID).
-- Startup automatically runs SQL migrations from `migrations/`; app fails fast if migrations cannot be applied.
+Want to adapt this for your org? Great—forks and extensions are welcome. The codebase uses a modern Rust module layout (no `mod.rs`) to keep boundaries clearer and reduce merge-conflict pain for long-lived branches. See [docs/EXTENDING.md](docs/EXTENDING.md).
 
-## FAQ / Troubleshooting
+Concrete extension ideas:
 
-- **Database connection fails at startup**
-  - Verify `DATABASE_URL`, database reachability, and credentials.
-  - Confirm Postgres is healthy: `docker compose ps` and `docker compose logs postgres`.
-- **`sqlx` offline expectations**
-  - This repository currently does not require checked-in `.sqlx` offline metadata.
-  - If you enable sqlx offline mode, regenerate metadata in CI and commit it with schema changes.
-- **Replay fails repeatedly**
-  - Check destination URL in `SOURCE_CONFIGS`, receiver availability, and response codes.
-  - Inspect recorded delivery attempts and error payloads for context.
-- **Signature mismatch errors**
-  - Ensure the HMAC is computed from the exact raw request body bytes.
-  - Confirm header format is `X-Signature: sha256=<hex>` and source secret is correct.
+1. A lightweight operator UI for event search + replay workflows.
+2. Queue-backed/asynchronous replay workers.
+3. Multi-tenant source/admin isolation.
+4. Retention policies and pruning automation.
+5. Provider-specific signature schemes beyond HMAC-SHA256.
+6. External blob storage (for example S3) for large payload archives.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, test strategy, style, and PR workflow.
-
-## Roadmap (v0.2+ ideas)
-
-- Configurable replay backoff policies
-- Optional scheduled retention/pruning worker
-- Richer filtering/query ergonomics for admin APIs
-- Redaction/encryption hooks for sensitive payload segments
-- Optional metrics endpoint and dashboards
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, style, testing, and PR workflow.
