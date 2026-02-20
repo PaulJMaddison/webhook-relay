@@ -1,4 +1,4 @@
-use webhook_relay::{api, config::AppConfig};
+use webhook_relay::{api, config::AppConfig, db};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,6 +10,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = AppConfig::from_env()?;
+
+    let pool = db::connect(&config.database_url).await?;
+    db::run_migrations(&pool).await?;
 
     tracing::info!(
         bind_addr = %config.bind_addr,
