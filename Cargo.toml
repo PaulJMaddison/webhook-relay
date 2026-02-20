@@ -2,6 +2,12 @@
 name = "webhook-relay"
 version = "0.1.0"
 edition = "2021"
+description = "Capture inbound webhooks, inspect them, and replay them to configured destinations."
+license = "MIT"
+repository = "https://github.com/webhook-relay/webhook-relay"
+homepage = "https://github.com/webhook-relay/webhook-relay"
+keywords = ["webhook", "relay", "http", "axum", "postgres"]
+categories = ["web-programming::http-server", "network-programming"]
 
 [dependencies]
 axum = "0.7"
