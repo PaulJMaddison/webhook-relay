@@ -11,6 +11,7 @@ pub enum EventStatus {
     Received,
     Delivered,
     Failed,
+    Dead,
 }
 
 impl EventStatus {
@@ -19,6 +20,7 @@ impl EventStatus {
             Self::Received => "received",
             Self::Delivered => "delivered",
             Self::Failed => "failed",
+            Self::Dead => "dead",
         }
     }
 }
