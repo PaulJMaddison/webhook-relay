@@ -2345,6 +2345,7 @@ dependencies = [
  "axum",
  "hex",
  "hmac",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_json",

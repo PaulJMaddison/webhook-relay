@@ -12,6 +12,10 @@ pub enum AppError {
         message: String,
         details: Option<Value>,
     },
+    PayloadTooLarge {
+        message: String,
+        details: Option<Value>,
+    },
     Auth {
         message: String,
         details: Option<Value>,
@@ -44,6 +48,13 @@ struct ErrorResponse {
 impl AppError {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::Validation {
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::PayloadTooLarge {
             message: message.into(),
             details: None,
         }
@@ -90,6 +101,10 @@ impl AppError {
                 message,
                 details: Some(details),
             },
+            Self::PayloadTooLarge { message, .. } => Self::PayloadTooLarge {
+                message,
+                details: Some(details),
+            },
             Self::Auth { message, .. } => Self::Auth {
                 message,
                 details: Some(details),
@@ -116,6 +131,7 @@ impl AppError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Auth { .. } => StatusCode::UNAUTHORIZED,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::Db { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -127,6 +143,7 @@ impl AppError {
     fn code(&self) -> &'static str {
         match self {
             Self::Validation { .. } => "validation",
+            Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::Auth { .. } => "auth",
             Self::NotFound { .. } => "not_found",
             Self::Db { .. } => "db",
@@ -138,6 +155,7 @@ impl AppError {
     fn message_and_details(&self) -> (&String, &Option<Value>) {
         match self {
             Self::Validation { message, details }
+            | Self::PayloadTooLarge { message, details }
             | Self::Auth { message, details }
             | Self::NotFound { message, details }
             | Self::Db { message, details }
