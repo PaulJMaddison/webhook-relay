@@ -15,7 +15,11 @@ impl AppConfig {
         let bind_addr = env::var("BIND_ADDR")?;
         let admin_basic_user = env::var("ADMIN_BASIC_USER")?;
         let admin_basic_pass = env::var("ADMIN_BASIC_PASS")?;
-        let source_destinations = serde_json::from_str(&env::var("SOURCE_DESTINATIONS")?)?;
+        let source_destinations = match env::var("SOURCE_DESTINATIONS") {
+            Ok(raw) => serde_json::from_str(&raw)?,
+            Err(env::VarError::NotPresent) => HashMap::new(),
+            Err(err) => return Err(Box::new(err)),
+        };
 
         Ok(Self {
             database_url,
