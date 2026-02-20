@@ -1,5 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
+use reqwest::Client;
+
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -16,9 +18,16 @@ use uuid::Uuid;
 
 use crate::errors::AppError;
 
-pub fn router(pool: PgPool, admin_basic_user: String, admin_basic_pass: String) -> Router {
+pub fn router(
+    pool: PgPool,
+    admin_basic_user: String,
+    admin_basic_pass: String,
+    source_destinations: HashMap<String, String>,
+) -> Router {
     let state = AppState {
         store: Arc::new(PgEventStore { pool }),
+        source_destinations,
+        http_client: Client::new(),
     };
 
     router_with_state(state, admin_basic_user, admin_basic_pass)
@@ -42,7 +51,8 @@ fn router_with_state(
 
     let events_routes = Router::new()
         .route("/events", get(events_index))
-        .route("/events/*rest", get(events_index))
+        .route("/events/:id", get(events_index))
+        .route("/events/:id/replay", post(replay_event))
         .layer(middleware::from_fn_with_state(
             admin_auth,
             basic_auth_middleware,
@@ -58,6 +68,8 @@ fn router_with_state(
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn EventStore>,
+    source_destinations: HashMap<String, String>,
+    http_client: Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +116,7 @@ struct PgEventStore {
 trait EventStore: Send + Sync {
     async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError>;
     async fn list_events(&self, filters: EventListFilters) -> Result<Vec<ListedEvent>, AppError>;
+    async fn get_event(&self, id: Uuid) -> Result<Option<NewEvent>, AppError>;
 }
 
 #[axum::async_trait]
@@ -158,6 +171,21 @@ impl EventStore for PgEventStore {
         .await?;
 
         Ok(events)
+    }
+
+    async fn get_event(&self, id: Uuid) -> Result<Option<NewEvent>, AppError> {
+        let event = sqlx::query_as::<_, NewEvent>(
+            r#"
+            SELECT id, source, method, path, query, headers, body, content_type
+            FROM events
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(event)
     }
 }
 
@@ -217,18 +245,14 @@ impl EventListQuery {
 }
 
 fn parse_cursor(raw: &str) -> Result<(Option<OffsetDateTime>, Option<Uuid>), AppError> {
-    let (received_at, id) = raw.split_once('|').ok_or_else(|| AppError {
-        message: "invalid cursor format".to_owned(),
-    })?;
+    let (received_at, id) = raw
+        .split_once('|')
+        .ok_or_else(|| AppError::bad_request("invalid cursor format"))?;
 
     let received_at =
         OffsetDateTime::parse(received_at, &time::format_description::well_known::Rfc3339)
-            .map_err(|_| AppError {
-                message: "invalid cursor timestamp".to_owned(),
-            })?;
-    let id = Uuid::parse_str(id).map_err(|_| AppError {
-        message: "invalid cursor id".to_owned(),
-    })?;
+            .map_err(|_| AppError::bad_request("invalid cursor timestamp"))?;
+    let id = Uuid::parse_str(id).map_err(|_| AppError::bad_request("invalid cursor id"))?;
 
     Ok((Some(received_at), Some(id)))
 }
@@ -410,6 +434,65 @@ async fn ingest_hook(
     Ok((StatusCode::CREATED, response_headers, Json(response)))
 }
 
+#[derive(Debug, Serialize)]
+struct ReplayResponse {
+    event_id: Uuid,
+    destination: String,
+    status: u16,
+}
+
+async fn replay_event(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let event = state.store.get_event(id).await?.ok_or_else(|| AppError {
+        status: StatusCode::NOT_FOUND,
+        message: "event not found".to_owned(),
+    })?;
+
+    let destination = state
+        .source_destinations
+        .get(&event.source)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::bad_request(format!("missing destination for source '{}'", event.source))
+        })?;
+
+    let target = build_target_url(&destination, &event.path, event.query.as_deref());
+    let mut request = state
+        .http_client
+        .request(
+            reqwest::Method::from_bytes(event.method.as_bytes())
+                .map_err(|err| AppError::internal(err.to_string()))?,
+            &target,
+        )
+        .body(event.body);
+
+    if let Some(content_type) = &event.content_type {
+        request = request.header(header::CONTENT_TYPE.as_str(), content_type);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+
+    Ok(Json(ReplayResponse {
+        event_id: id,
+        destination: target,
+        status: response.status().as_u16(),
+    }))
+}
+
+fn build_target_url(base: &str, path: &str, query: Option<&str>) -> String {
+    let mut url = format!("{}{}", base.trim_end_matches('/'), path);
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+    url
+}
+
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for name in headers.keys() {
@@ -423,6 +506,23 @@ fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
     }
 
     serde_json::Value::Object(out)
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for NewEvent {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+
+        Ok(Self {
+            id: row.try_get("id")?,
+            source: row.try_get("source")?,
+            method: row.try_get("method")?,
+            path: row.try_get("path")?,
+            query: row.try_get("query")?,
+            headers: row.try_get("headers")?,
+            body: row.try_get("body")?,
+            content_type: row.try_get("content_type")?,
+        })
+    }
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for StoredEvent {
@@ -452,9 +552,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ListedEvent {
 
 impl From<sqlx::Error> for AppError {
     fn from(value: sqlx::Error) -> Self {
-        AppError {
-            message: value.to_string(),
-        }
+        AppError::internal(value.to_string())
     }
 }
 
@@ -536,6 +634,27 @@ mod tests {
             items.truncate(usize::from(filters.limit) + 1);
             Ok(items)
         }
+
+        async fn get_event(&self, id: Uuid) -> Result<Option<NewEvent>, AppError> {
+            let event = self
+                .events
+                .read()
+                .await
+                .iter()
+                .find(|event| event.id == id)
+                .map(|event| NewEvent {
+                    id: event.id,
+                    source: event.source.clone(),
+                    method: event.method.clone(),
+                    path: event.path.clone(),
+                    query: event.query.clone(),
+                    headers: event.headers.clone(),
+                    body: event.body.clone(),
+                    content_type: event.content_type.clone(),
+                });
+
+            Ok(event)
+        }
     }
 
     #[tokio::test]
@@ -544,6 +663,8 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -588,6 +709,8 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -620,6 +743,8 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
+                source_destinations: HashMap::new(),
+                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -652,6 +777,8 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -677,6 +804,8 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
+                source_destinations: HashMap::new(),
+                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -698,11 +827,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_returns_bad_request_when_source_destination_missing() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store),
+                source_destinations: HashMap::new(),
+                http_client: Client::new(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        let event_id = ingest_response
+            .headers()
+            .get("X-Event-Id")
+            .and_then(|value| value.to_str().ok())
+            .expect("event id header should exist");
+
+        let replay_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/events/{event_id}/replay"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(replay_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn events_returns_items_and_next_cursor() {
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
