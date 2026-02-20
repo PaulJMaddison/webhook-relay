@@ -30,6 +30,17 @@ async fn postgres_event_status_round_trip_and_default() -> Result<(), Box<dyn st
 
     sqlx::query(
         r#"
+        INSERT INTO events (source, method, path, headers, body, status)
+        VALUES ($1, 'POST', '/hooks/test', '{}'::jsonb, '\\x02'::bytea, $2)
+        "#,
+    )
+    .bind(format!("{source_prefix}-dead"))
+    .bind(EventStatus::Dead)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         INSERT INTO events (source, method, path, headers, body)
         VALUES ($1, 'POST', '/hooks/test', '{}'::jsonb, '\\x01'::bytea)
         "#,
@@ -51,7 +62,14 @@ async fn postgres_event_status_round_trip_and_default() -> Result<(), Box<dyn st
     .await?;
 
     let statuses = rows.into_iter().map(|row| row.status).collect::<Vec<_>>();
-    assert_eq!(statuses, vec![EventStatus::Received, EventStatus::Failed]);
+    assert_eq!(
+        statuses,
+        vec![
+            EventStatus::Dead,
+            EventStatus::Received,
+            EventStatus::Failed
+        ]
+    );
 
     sqlx::query("DELETE FROM events WHERE source LIKE $1")
         .bind(format!("{source_prefix}%"))

@@ -55,6 +55,8 @@ struct AdminAuthConfig {
     pass: String,
 }
 
+const REPLAY_MAX_ATTEMPTS: usize = 3;
+
 fn build_http_client() -> Client {
     Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -77,6 +79,7 @@ fn router_with_state(
         .route("/events", get(events_index))
         .route("/events/:id", get(event_show))
         .route("/events/:id/replay", post(replay_event))
+        .route("/events/:id/reset", post(reset_event))
         .layer(middleware::from_fn_with_state(
             admin_auth,
             basic_auth_middleware,
@@ -432,6 +435,7 @@ async fn replay_event(
 
     tracing::info!("replay attempt started");
 
+    let mut final_status = EventStatus::Dead;
     let mut request = state
         .http_client
         .request(method, destination.clone())
@@ -441,10 +445,25 @@ async fn replay_event(
         .header("X-Request-Id", request_id.0.clone())
         .body(event.body.clone());
 
-    if let Some(content_type) = &event.content_type {
-        request = request.header(reqwest::header::CONTENT_TYPE, content_type);
-    }
+    for attempt_number in 1..=REPLAY_MAX_ATTEMPTS {
+        let started_at = std::time::Instant::now();
 
+        let mut request = state
+            .http_client
+            .request(method.clone(), destination.clone())
+            .header("X-Webhook-Replay", "true")
+            .header("X-Original-Event-Id", event.id.to_string())
+            .body(event.body.clone());
+
+        if let Some(content_type) = &event.content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+
+        let original_headers = json_to_headermap(&event.headers);
+        request =
+            apply_forwarded_headers(request, &original_headers, &state.replay_forward_headers);
+
+        let (attempt_status, attempt) = match request.send().await {
         let attempt = match request.send().await {
             Ok(response) => {
                 let response_status = i32::from(response.status().as_u16());
@@ -454,11 +473,36 @@ async fn replay_event(
                     .await
                     .map(|bytes| bytes.to_vec())
                     .map_err(|err| AppError::upstream(err.to_string()))?;
+                let status = if (200..300).contains(&response_status) {
+                    EventStatus::Delivered
+                } else {
+                    EventStatus::Failed
+                };
+
+                (
+                    status,
+                    NewDeliveryAttempt {
+                        event_id: event.id,
+                        destination: destination.clone(),
+                        response_status: Some(response_status),
+                        response_headers: Some(headers),
+                        response_body: Some(body),
+                        error: None,
+                        duration_ms: started_at.elapsed().as_millis() as i32,
+                    },
+                )
+            }
+            Err(err) => (
+                EventStatus::Failed,
 
                 NewDeliveryAttempt {
                     id: attempt_id,
                     event_id: event.id,
                     destination: destination.clone(),
+                    response_status: None,
+                    response_headers: None,
+                    response_body: None,
+                    error: Some(err.to_string()),
                     response_status: Some(response_status),
                     response_headers: Some(headers),
                     response_body: Some(body),
@@ -468,7 +512,14 @@ async fn replay_event(
             }
             Err(err) => NewDeliveryAttempt {
                 },
-            )
+            ),
+        };
+
+        state.store.create_delivery_attempt(attempt).await?;
+
+        if attempt_status == EventStatus::Delivered {
+            final_status = EventStatus::Delivered;
+            break;
         }
         Err(err) => (
             EventStatus::Failed,
@@ -529,13 +580,51 @@ async fn replay_event(
         "replay attempt finished"
     );
 
-    state.store.create_delivery_attempt(attempt).await?;
-    state.store.update_event_status(event.id, status).await?;
+        if attempt_number < REPLAY_MAX_ATTEMPTS {
+            tracing::warn!(
+                request_id = %request_id.0,
+                event_id = %event.id,
+                attempt_number,
+                "replay attempt failed, retrying"
+            );
+        }
+    }
+
+    state
+        .store
+        .update_event_status(event.id, final_status)
+        .await?;
+
+    tracing::info!(
+        request_id = %request_id.0,
+        event_id = %event.id,
+        status = ?final_status,
+        "replay finished"
+    );
 
     Ok((
         StatusCode::OK,
         Json(ReplayResponse {
             event_id: event.id,
+            status: final_status,
+        }),
+    ))
+}
+
+async fn reset_event(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    state
+        .store
+        .update_event_status(id, EventStatus::Received)
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ReplayResponse {
+            event_id: id,
+            status: EventStatus::Received,
             attempts,
             final_status,
         }),
@@ -1087,6 +1176,8 @@ mod tests {
     impl EventStore for MemoryStore {
         async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError> {
             let received_at = OffsetDateTime::now_utc();
+            let id = event.id;
+            let source = event.source.clone();
             self.events.write().await.push(StoredMemoryEvent {
                 received_at,
                 event: event.clone(),
@@ -1126,6 +1217,12 @@ mod tests {
                 .map(|event| ListedEvent {
                     id: event.event.id,
                     source: event.event.source.clone(),
+                    status: statuses
+                        .get(&event.event.id)
+                        .copied()
+                        .unwrap_or(EventStatus::Received),
+                    received_at: event.received_at,
+                    body_size_bytes: event.event.body_size_bytes,
                     status: EventStatus::Received,
                     received_at: event.received_at,
                     body_size_bytes: event.event.body_size_bytes,
@@ -2437,12 +2534,152 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_persists_uri_query_string() {
+    async fn replay_sets_dead_status_after_all_retries_fail() {
+        let mut destinations = HashMap::new();
+        destinations.insert("stripe".to_owned(), "http://127.0.0.1:1/".to_owned());
+
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: destinations,
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("ingest request should succeed");
+        assert_eq!(ingest_response.status(), StatusCode::CREATED);
+
+        let event_id = store.events.read().await[0].event.id;
+        let replay_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/events/{event_id}/replay"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("replay request should succeed");
+
+        assert_eq!(replay_response.status(), StatusCode::OK);
+
+        let attempts = store.attempts.read().await;
+        assert_eq!(attempts.len(), REPLAY_MAX_ATTEMPTS);
+
+        let statuses = store.statuses.read().await;
+        assert_eq!(statuses.get(&event_id).copied(), Some(EventStatus::Dead));
+
+        let dead_list = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/events?status=dead")
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("events list should succeed");
+
+        assert_eq!(dead_list.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(dead_list.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items should be an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("id").and_then(Value::as_str),
+            Some(event_id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_endpoint_sets_status_back_to_received() {
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
                 source_configs: HashMap::new(),
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("ingest request should succeed");
+        assert_eq!(ingest_response.status(), StatusCode::CREATED);
+
+        let event_id = store.events.read().await[0].event.id;
+        store
+            .update_event_status(event_id, EventStatus::Dead)
+            .await
+            .expect("status update should succeed");
+
+        let reset_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/events/{event_id}/reset"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("reset request should succeed");
+
+        assert_eq!(reset_response.status(), StatusCode::OK);
+        let statuses = store.statuses.read().await;
+        assert_eq!(
+            statuses.get(&event_id).copied(),
+            Some(EventStatus::Received)
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_persists_uri_query_string() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 1024,
                 replay_forward_headers: default_replay_forward_headers(),
