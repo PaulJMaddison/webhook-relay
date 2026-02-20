@@ -301,10 +301,7 @@ async fn replay_event(
         .store
         .load_event_for_replay(id)
         .await?
-        .ok_or_else(|| AppError {
-            status: StatusCode::NOT_FOUND,
-            message: format!("event not found: {id}"),
-        })?;
+        .ok_or_else(|| AppError::not_found(format!("event not found: {id}")))?;
 
     tracing::info!(request_id = %request_id.0, event_id = %event.id, "replaying event");
 
@@ -312,28 +309,24 @@ async fn replay_event(
         .source_destinations
         .get(&event.source)
         .cloned()
-        .ok_or_else(|| AppError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("no destination configured for source: {}", event.source),
+        .ok_or_else(|| {
+            AppError::validation(format!(
+                "no destination configured for source: {}",
+                event.source
+            ))
         })?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .no_proxy()
         .build()
-        .map_err(|err| AppError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: err.to_string(),
-        })?;
+        .map_err(|err| AppError::internal(err.to_string()))?;
 
     let started_at = std::time::Instant::now();
     let method = event
         .method
         .parse::<reqwest::Method>()
-        .map_err(|err| AppError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: err.to_string(),
-        })?;
+        .map_err(|err| AppError::internal(err.to_string()))?;
 
     let mut request = client
         .request(method, destination.clone())
@@ -353,10 +346,7 @@ async fn replay_event(
                 .bytes()
                 .await
                 .map(|bytes| bytes.to_vec())
-                .map_err(|err| AppError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: err.to_string(),
-                })?;
+                .map_err(|err| AppError::upstream(err.to_string()))?;
             let status = if response_status >= 200 && response_status < 300 {
                 "delivered"
             } else {
@@ -462,12 +452,12 @@ impl EventListQuery {
 fn parse_cursor(raw: &str) -> Result<(Option<OffsetDateTime>, Option<Uuid>), AppError> {
     let (received_at, id) = raw
         .split_once('|')
-        .ok_or_else(|| AppError::bad_request("invalid cursor format"))?;
+        .ok_or_else(|| AppError::validation("invalid cursor format"))?;
 
     let received_at =
         OffsetDateTime::parse(received_at, &time::format_description::well_known::Rfc3339)
-            .map_err(|_| AppError::bad_request("invalid cursor timestamp"))?;
-    let id = Uuid::parse_str(id).map_err(|_| AppError::bad_request("invalid cursor id"))?;
+            .map_err(|_| AppError::validation("invalid cursor timestamp"))?;
+    let id = Uuid::parse_str(id).map_err(|_| AppError::validation("invalid cursor id"))?;
 
     Ok((Some(received_at), Some(id)))
 }
@@ -639,18 +629,12 @@ fn validate_source_signature(
         .get("X-Signature")
         .and_then(|value| value.to_str().ok())
         .and_then(parse_signature_header)
-        .ok_or_else(|| AppError {
-            status: StatusCode::UNAUTHORIZED,
-            message: "invalid signature".to_owned(),
-        })?;
+        .ok_or_else(|| AppError::auth("invalid signature"))?;
 
     if verify_signature(secret, body, &provided) {
         Ok(())
     } else {
-        Err(AppError {
-            status: StatusCode::UNAUTHORIZED,
-            message: "invalid signature".to_owned(),
-        })
+        Err(AppError::auth("invalid signature"))
     }
 }
 
@@ -792,7 +776,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReplayEvent {
 
 impl From<sqlx::Error> for AppError {
     fn from(value: sqlx::Error) -> Self {
-        AppError::internal(value.to_string())
+        AppError::db(value.to_string())
     }
 }
 
@@ -1299,6 +1283,50 @@ mod tests {
             .expect("request should succeed");
 
         assert_eq!(replay_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_cursor_returns_unified_error_payload() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                http_client: Client::new(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/events?cursor=invalid")
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+
+        assert_eq!(
+            payload.get("code"),
+            Some(&Value::String("validation".to_owned()))
+        );
+        assert_eq!(
+            payload.get("message"),
+            Some(&Value::String("invalid cursor format".to_owned()))
+        );
+        assert_eq!(payload.get("details"), Some(&Value::Null));
     }
 
     #[tokio::test]

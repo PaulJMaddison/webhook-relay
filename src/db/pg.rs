@@ -74,6 +74,6 @@ impl EventStore for PgEventStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        event.ok_or(AppError::NotFound)
+        event.ok_or_else(|| AppError::not_found(format!("event not found: {id}")))
     }
 }
