@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -103,6 +103,7 @@ struct PgEventStore {
 #[axum::async_trait]
 trait EventStore: Send + Sync {
     async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError>;
+    async fn list_events(&self, filters: EventListFilters) -> Result<Vec<ListedEvent>, AppError>;
 }
 
 #[axum::async_trait]
@@ -128,10 +129,135 @@ impl EventStore for PgEventStore {
 
         Ok(stored)
     }
+
+    async fn list_events(&self, filters: EventListFilters) -> Result<Vec<ListedEvent>, AppError> {
+        let events = sqlx::query_as::<_, ListedEvent>(
+            r#"
+            SELECT id, source, status, received_at
+            FROM events
+            WHERE ($1::text IS NULL OR source = $1)
+              AND ($2::text IS NULL OR status = $2)
+              AND ($3::timestamptz IS NULL OR received_at >= $3)
+              AND ($4::timestamptz IS NULL OR received_at <= $4)
+              AND (
+                $5::timestamptz IS NULL
+                OR (received_at, id) < ($5, $6)
+              )
+            ORDER BY received_at DESC, id DESC
+            LIMIT $7
+            "#,
+        )
+        .bind(filters.source)
+        .bind(filters.status)
+        .bind(filters.since)
+        .bind(filters.until)
+        .bind(filters.cursor_received_at)
+        .bind(filters.cursor_id)
+        .bind(i64::from(filters.limit) + 1)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(events)
+    }
 }
 
-async fn events_index() -> impl IntoResponse {
-    StatusCode::NO_CONTENT
+#[derive(Debug, Deserialize)]
+struct EventListQuery {
+    source: Option<String>,
+    status: Option<String>,
+    since: Option<OffsetDateTime>,
+    until: Option<OffsetDateTime>,
+    limit: Option<u16>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EventListFilters {
+    source: Option<String>,
+    status: Option<String>,
+    since: Option<OffsetDateTime>,
+    until: Option<OffsetDateTime>,
+    cursor_received_at: Option<OffsetDateTime>,
+    cursor_id: Option<Uuid>,
+    limit: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct ListedEvent {
+    id: Uuid,
+    source: String,
+    status: String,
+    received_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+struct EventListResponse {
+    items: Vec<ListedEvent>,
+    next_cursor: Option<String>,
+}
+
+impl EventListQuery {
+    fn into_filters(self) -> Result<EventListFilters, AppError> {
+        let limit = self.limit.unwrap_or(50).min(200);
+        let (cursor_received_at, cursor_id) = match self.cursor {
+            Some(raw) => parse_cursor(&raw)?,
+            None => (None, None),
+        };
+
+        Ok(EventListFilters {
+            source: self.source,
+            status: self.status,
+            since: self.since,
+            until: self.until,
+            cursor_received_at,
+            cursor_id,
+            limit,
+        })
+    }
+}
+
+fn parse_cursor(raw: &str) -> Result<(Option<OffsetDateTime>, Option<Uuid>), AppError> {
+    let (received_at, id) = raw.split_once('|').ok_or_else(|| AppError {
+        message: "invalid cursor format".to_owned(),
+    })?;
+
+    let received_at =
+        OffsetDateTime::parse(received_at, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| AppError {
+                message: "invalid cursor timestamp".to_owned(),
+            })?;
+    let id = Uuid::parse_str(id).map_err(|_| AppError {
+        message: "invalid cursor id".to_owned(),
+    })?;
+
+    Ok((Some(received_at), Some(id)))
+}
+
+fn encode_cursor(event: &ListedEvent) -> String {
+    let ts = event
+        .received_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("received_at should format as RFC3339");
+    format!("{}|{}", ts, event.id)
+}
+
+async fn events_index(
+    State(state): State<AppState>,
+    Query(query): Query<EventListQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let filters = query.into_filters()?;
+    let limit = usize::from(filters.limit);
+    let mut items = state.store.list_events(filters).await?;
+
+    let next_cursor = if items.len() > limit {
+        let last_visible = items.get(limit - 1).map(encode_cursor);
+        items.truncate(limit);
+        last_visible
+    } else {
+        None
+    };
+
+    Ok(Json(EventListResponse { items, next_cursor }))
 }
 
 async fn basic_auth_middleware(
@@ -311,6 +437,19 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for StoredEvent {
     }
 }
 
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ListedEvent {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+
+        Ok(Self {
+            id: row.try_get("id")?,
+            source: row.try_get("source")?,
+            status: row.try_get("status")?,
+            received_at: row.try_get("received_at")?,
+        })
+    }
+}
+
 impl From<sqlx::Error> for AppError {
     fn from(value: sqlx::Error) -> Self {
         AppError {
@@ -354,6 +493,48 @@ mod tests {
                 source: event.source,
                 received_at: OffsetDateTime::now_utc(),
             })
+        }
+
+        async fn list_events(
+            &self,
+            filters: EventListFilters,
+        ) -> Result<Vec<ListedEvent>, AppError> {
+            let mut items = self
+                .events
+                .read()
+                .await
+                .iter()
+                .filter(|event| match &filters.source {
+                    Some(source) => &event.source == source,
+                    None => true,
+                })
+                .map(|event| ListedEvent {
+                    id: event.id,
+                    source: event.source.clone(),
+                    status: "received".to_owned(),
+                    received_at: OffsetDateTime::now_utc(),
+                })
+                .collect::<Vec<_>>();
+
+            items.sort_by(|a, b| (b.received_at, b.id).cmp(&(a.received_at, a.id)));
+
+            if let Some(status) = filters.status {
+                items.retain(|e| e.status == status);
+            }
+            if let Some(since) = filters.since {
+                items.retain(|e| e.received_at >= since);
+            }
+            if let Some(until) = filters.until {
+                items.retain(|e| e.received_at <= until);
+            }
+            if let (Some(cursor_received_at), Some(cursor_id)) =
+                (filters.cursor_received_at, filters.cursor_id)
+            {
+                items.retain(|e| (e.received_at, e.id) < (cursor_received_at, cursor_id));
+            }
+
+            items.truncate(usize::from(filters.limit) + 1);
+            Ok(items)
         }
     }
 
@@ -513,6 +694,46 @@ mod tests {
             .await
             .expect("request should succeed");
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn events_returns_items_and_next_cursor() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        for source in ["one", "two"] {
+            let _ = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/hooks/{source}").as_str())
+                        .body(Body::from("{}"))
+                        .expect("valid request"),
+                )
+                .await
+                .expect("request should succeed");
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/events?limit=1")
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
