@@ -19,13 +19,13 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{domain::EventStatus, errors::AppError};
+use crate::{config::SourceConfig, domain::EventStatus, errors::AppError};
 
 pub fn router(
     pool: PgPool,
     admin_basic_user: String,
     admin_basic_pass: String,
-    source_destinations: HashMap<String, String>,
+    source_configs: HashMap<String, SourceConfig>,
     source_secrets: HashMap<String, String>,
     max_webhook_size_bytes: usize,
     replay_forward_headers: Vec<String>,
@@ -34,7 +34,7 @@ pub fn router(
 
     let state = AppState {
         store: Arc::new(PgEventStore { pool }),
-        source_destinations,
+        source_configs,
         source_secrets,
         max_webhook_size_bytes,
         replay_forward_headers,
@@ -123,7 +123,7 @@ async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Nex
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn EventStore>,
-    source_destinations: HashMap<String, String>,
+    source_configs: HashMap<String, SourceConfig>,
     source_secrets: HashMap<String, String>,
     max_webhook_size_bytes: usize,
     replay_forward_headers: Vec<String>,
@@ -178,6 +178,7 @@ struct ReplayEvent {
 
 #[derive(Debug)]
 struct NewDeliveryAttempt {
+    id: Uuid,
     event_id: Uuid,
     destination: String,
     response_status: Option<i32>,
@@ -295,6 +296,7 @@ impl EventStore for PgEventStore {
         sqlx::query(
             r#"
             INSERT INTO delivery_attempts (
+                id,
                 event_id,
                 destination,
                 response_status,
@@ -303,9 +305,10 @@ impl EventStore for PgEventStore {
                 error,
                 duration_ms
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
+        .bind(attempt.id)
         .bind(attempt.event_id)
         .bind(attempt.destination)
         .bind(attempt.response_status)
@@ -343,13 +346,38 @@ impl EventStore for PgEventStore {
 #[derive(Debug, Serialize)]
 struct ReplayResponse {
     event_id: Uuid,
-    status: EventStatus,
+    attempts: Vec<ReplayAttemptResponse>,
+    final_status: EventStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayAttemptResponse {
+    response_status: Option<i32>,
+    error: Option<String>,
+    duration_ms: i32,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ReplayQuery {
+    retries: Option<u8>,
+}
+
+impl ReplayQuery {
+    fn retry_count(&self) -> Result<u8, AppError> {
+        let retries = self.retries.unwrap_or(0);
+        if retries > 3 {
+            return Err(AppError::validation("retries must be between 0 and 3"));
+        }
+
+        Ok(retries)
+    }
 }
 
 async fn replay_event(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Path(id): Path<Uuid>,
+    Query(query): Query<ReplayQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let event = state
         .store
@@ -359,23 +387,63 @@ async fn replay_event(
 
     tracing::info!(request_id = %request_id.0, event_id = %event.id, "replaying event");
 
-    let destination = state
-        .source_destinations
-        .get(&event.source)
-        .cloned()
-        .ok_or_else(|| {
-            AppError::validation(format!(
-                "no destination configured for source: {}",
-                event.source
-            ))
-        })?;
+    let source_config = state.source_configs.get(&event.source).ok_or_else(|| {
+        AppError::validation(format!(
+            "no destination configured for source: {}",
+            event.source
+        ))
+    })?;
 
+    let destination = source_config.url.clone();
+
+    let retries = query.retry_count()?;
+    let started_at = std::time::Instant::now();
+    let attempt_id = Uuid::new_v4();
     let method = event
         .method
         .parse::<reqwest::Method>()
         .map_err(|err| AppError::internal(err.to_string()))?;
+    let original_headers = json_to_headermap(&event.headers);
+    let max_attempts = retries + 1;
+    let mut final_status = EventStatus::Failed;
+    let mut attempts = Vec::with_capacity(usize::from(max_attempts));
+
+    for attempt_idx in 0..max_attempts {
+        let started_at = std::time::Instant::now();
+        let mut request = state
+            .http_client
+            .request(method.clone(), destination.clone())
+            .header("X-Webhook-Replay", "true")
+            .header("X-Original-Event-Id", event.id.to_string())
+            .body(event.body.clone());
+
+        if let Some(content_type) = &event.content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+
+        request =
+            apply_forwarded_headers(request, &original_headers, &state.replay_forward_headers);
+    let replay_span = tracing::info_span!(
+        "replay_attempt",
+        request_id = %request_id.0,
+        event_id = %event.id,
+        source = %event.source,
+        destination = %destination,
+        attempt_id = %attempt_id
+    );
+    let _replay_span_guard = replay_span.enter();
+
+    tracing::info!("replay attempt started");
 
     let mut final_status = EventStatus::Dead;
+    let mut request = state
+        .http_client
+        .request(method, destination.clone())
+        .header("X-Webhook-Replay", "true")
+        .header("X-Original-Event-Id", event.id.to_string())
+        .timeout(std::time::Duration::from_millis(source_config.timeout_ms))
+        .header("X-Request-Id", request_id.0.clone())
+        .body(event.body.clone());
 
     for attempt_number in 1..=REPLAY_MAX_ATTEMPTS {
         let started_at = std::time::Instant::now();
@@ -396,6 +464,7 @@ async fn replay_event(
             apply_forwarded_headers(request, &original_headers, &state.replay_forward_headers);
 
         let (attempt_status, attempt) = match request.send().await {
+        let attempt = match request.send().await {
             Ok(response) => {
                 let response_status = i32::from(response.status().as_u16());
                 let headers = headers_to_json_value(response.headers());
@@ -425,14 +494,23 @@ async fn replay_event(
             }
             Err(err) => (
                 EventStatus::Failed,
+
                 NewDeliveryAttempt {
+                    id: attempt_id,
                     event_id: event.id,
                     destination: destination.clone(),
                     response_status: None,
                     response_headers: None,
                     response_body: None,
                     error: Some(err.to_string()),
+                    response_status: Some(response_status),
+                    response_headers: Some(headers),
+                    response_body: Some(body),
+                    error: None,
                     duration_ms: started_at.elapsed().as_millis() as i32,
+                }
+            }
+            Err(err) => NewDeliveryAttempt {
                 },
             ),
         };
@@ -443,6 +521,64 @@ async fn replay_event(
             final_status = EventStatus::Delivered;
             break;
         }
+        Err(err) => (
+            EventStatus::Failed,
+            NewDeliveryAttempt {
+                id: attempt_id,
+                event_id: event.id,
+                destination: destination.clone(),
+                response_status: None,
+                response_headers: None,
+                response_body: None,
+                error: Some(err.to_string()),
+                duration_ms: started_at.elapsed().as_millis() as i32,
+            },
+        };
+
+        let should_retry = match attempt.response_status {
+            Some(code) => code >= 500,
+            None => true,
+        };
+
+        final_status = match attempt.response_status {
+            Some(code) if (200..300).contains(&code) => EventStatus::Delivered,
+            _ => EventStatus::Failed,
+        };
+
+        let attempt_response = ReplayAttemptResponse {
+            response_status: attempt.response_status,
+            error: attempt.error.clone(),
+            duration_ms: attempt.duration_ms,
+        };
+
+        state.store.create_delivery_attempt(attempt).await?;
+        attempts.push(attempt_response);
+
+        if final_status == EventStatus::Delivered
+            || !should_retry
+            || attempt_idx == max_attempts - 1
+        {
+            break;
+        }
+
+        let backoff_ms = (200_u64 * (1_u64 << attempt_idx)).min(1_000);
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+    }
+
+    state
+        .store
+        .update_event_status(event.id, final_status)
+        .await?;
+
+    tracing::info!(request_id = %request_id.0, event_id = %event.id, status = ?final_status, "replay finished");
+
+    tracing::info!(
+        status = ?status,
+        response_status = attempt.response_status,
+        duration_ms = attempt.duration_ms,
+        error = attempt.error.as_deref(),
+        "replay attempt finished"
+    );
 
         if attempt_number < REPLAY_MAX_ATTEMPTS {
             tracing::warn!(
@@ -489,6 +625,8 @@ async fn reset_event(
         Json(ReplayResponse {
             event_id: id,
             status: EventStatus::Received,
+            attempts,
+            final_status,
         }),
     ))
 }
@@ -1040,6 +1178,14 @@ mod tests {
             let received_at = OffsetDateTime::now_utc();
             let id = event.id;
             let source = event.source.clone();
+            self.events.write().await.push(StoredMemoryEvent {
+                received_at,
+                event: event.clone(),
+            });
+            let id = event.id;
+            let source = event.source.clone();
+            let event_id = event.id;
+            let source = event.source.clone();
 
             self.events
                 .write()
@@ -1048,6 +1194,7 @@ mod tests {
 
             Ok(StoredEvent {
                 id,
+                id: event_id,
                 source,
                 received_at,
             })
@@ -1076,24 +1223,45 @@ mod tests {
                         .unwrap_or(EventStatus::Received),
                     received_at: event.received_at,
                     body_size_bytes: event.event.body_size_bytes,
+                    status: EventStatus::Received,
+                    received_at: event.received_at,
+                    body_size_bytes: event.event.body_size_bytes,
+                    status: statuses
+                        .get(&event.event.id)
+                        .copied()
+                        .unwrap_or(EventStatus::Received),
+                    received_at: event.received_at,
+                    body_size_bytes: event.event.body_size_bytes,
+                .map(|stored| ListedEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
+                    status: EventStatus::Received,
+                    received_at: stored.received_at,
+                    body_size_bytes: stored.event.body_size_bytes,
                 })
                 .collect::<Vec<_>>();
 
-            items.sort_by(|a, b| (b.received_at, b.id).cmp(&(a.received_at, a.id)));
-
             if let Some(status) = filters.status {
-                items.retain(|e| e.status == status);
+                items.retain(|event| event.status == status);
+            }
+            if let Some(source) = filters.source {
+                items.retain(|event| event.source == source);
             }
             if let Some(since) = filters.since {
-                items.retain(|e| e.received_at >= since);
+                items.retain(|event| event.received_at >= since);
             }
             if let Some(until) = filters.until {
-                items.retain(|e| e.received_at <= until);
+                items.retain(|event| event.received_at <= until);
             }
+
+            items.sort_by(|a, b| (b.received_at, b.id).cmp(&(a.received_at, a.id)));
+
             if let (Some(cursor_received_at), Some(cursor_id)) =
                 (filters.cursor_received_at, filters.cursor_id)
             {
-                items.retain(|e| (e.received_at, e.id) < (cursor_received_at, cursor_id));
+                items.retain(|event| {
+                    (event.received_at, event.id) < (cursor_received_at, cursor_id)
+                });
             }
 
             items.truncate(usize::from(filters.limit) + 1);
@@ -1111,12 +1279,25 @@ mod tests {
                 .map(|event| ListedEvent {
                     id: event.event.id,
                     source: event.event.source.clone(),
+                    status: EventStatus::Received,
+                    received_at: event.received_at,
+                    body_size_bytes: event.event.body_size_bytes,
                     status: statuses
                         .get(&event.event.id)
                         .copied()
                         .unwrap_or(EventStatus::Received),
                     received_at: event.received_at,
                     body_size_bytes: event.event.body_size_bytes,
+                .find(|stored| stored.event.id == id)
+                .map(|stored| ListedEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
+                    status: statuses
+                        .get(&stored.event.id)
+                        .copied()
+                        .unwrap_or(EventStatus::Received),
+                    received_at: stored.received_at,
+                    body_size_bytes: stored.event.body_size_bytes,
                 });
 
             Ok(event)
@@ -1136,6 +1317,14 @@ mod tests {
                     headers: event.event.headers.clone(),
                     body: event.event.body.clone(),
                     content_type: event.event.content_type.clone(),
+                .find(|stored| stored.event.id == id)
+                .map(|stored| ReplayEvent {
+                    id: stored.event.id,
+                    source: stored.event.source.clone(),
+                    method: stored.event.method.clone(),
+                    headers: stored.event.headers.clone(),
+                    body: stored.event.body.clone(),
+                    content_type: stored.event.content_type.clone(),
                 });
 
             Ok(event)
@@ -1196,13 +1385,55 @@ mod tests {
         (format!("http://{addr}/"), rx)
     }
 
+    async fn spawn_flaky_receiver() -> (String, tokio::sync::mpsc::UnboundedReceiver<StatusCode>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local addr");
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let app = Router::new().route(
+            "/",
+            post({
+                let tx = tx.clone();
+                let attempts = attempts.clone();
+                move || {
+                    let tx = tx.clone();
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let status = if attempt == 0 {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::OK
+                        };
+                        let _ = tx.send(status);
+                        status
+                    }
+                }
+            }),
+        );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test receiver should serve");
+        });
+
+        (format!("http://{addr}/"), rx)
+    }
+
     #[tokio::test]
     async fn response_includes_generated_request_id_when_missing() {
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1233,7 +1464,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1271,7 +1502,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1331,7 +1562,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1375,7 +1606,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 8,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1407,7 +1638,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 8,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1460,7 +1691,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1498,7 +1729,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1532,7 +1763,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets,
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1566,7 +1797,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets,
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1603,7 +1834,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1635,7 +1866,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1670,6 +1901,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/events/{event_id}/replay"))
                     .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .header("x-request-id", "req-replay-1")
                     .body(Body::empty())
                     .expect("valid request"),
             )
@@ -1685,7 +1917,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1732,7 +1964,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1793,7 +2025,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1853,7 +2085,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1953,13 +2185,19 @@ mod tests {
     async fn replay_forwards_exact_body_and_content_type() {
         let (destination, received) = spawn_test_receiver().await;
         let mut destinations = HashMap::new();
-        destinations.insert("stripe".to_owned(), destination);
+        destinations.insert(
+            "stripe".to_owned(),
+            SourceConfig {
+                url: destination,
+                timeout_ms: 10_000,
+            },
+        );
 
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: destinations,
+                source_configs: destinations,
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1993,6 +2231,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/events/{event_id}/replay"))
                     .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .header("x-request-id", "req-replay-1")
                     .body(Body::empty())
                     .expect("valid request"),
             )
@@ -2025,9 +2264,109 @@ mod tests {
             Some(event_id.to_string().as_str())
         );
 
+        assert_eq!(
+            headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("req-replay-1")
+        );
+
         let attempts = store.attempts.read().await;
         assert_eq!(attempts.len(), 1);
+        assert_ne!(attempts[0].id, Uuid::nil());
         assert_eq!(attempts[0].response_status, Some(200));
+
+        let statuses = store.statuses.read().await;
+        assert_eq!(
+            statuses.get(&event_id).copied(),
+            Some(EventStatus::Delivered)
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_retries_on_5xx_then_succeeds() {
+        let (destination, mut statuses) = spawn_flaky_receiver().await;
+        let mut destinations = HashMap::new();
+        destinations.insert("stripe".to_owned(), destination);
+
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: destinations,
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("ingest request should succeed");
+
+        assert_eq!(ingest_response.status(), StatusCode::CREATED);
+
+        let event_id = store.events.read().await[0].event.id;
+        let replay_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/events/{event_id}/replay?retries=2"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("replay request should succeed");
+
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(replay_response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(
+            payload.get("final_status").and_then(Value::as_str),
+            Some("delivered")
+        );
+        let attempts = payload
+            .get("attempts")
+            .and_then(Value::as_array)
+            .expect("attempts should be an array");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0].get("response_status").and_then(Value::as_i64),
+            Some(500)
+        );
+        assert_eq!(
+            attempts[1].get("response_status").and_then(Value::as_i64),
+            Some(200)
+        );
+
+        let first_status = tokio::time::timeout(std::time::Duration::from_secs(2), statuses.recv())
+            .await
+            .expect("first attempt should complete")
+            .expect("channel should stay open");
+        let second_status =
+            tokio::time::timeout(std::time::Duration::from_secs(2), statuses.recv())
+                .await
+                .expect("second attempt should complete")
+                .expect("channel should stay open");
+
+        assert_eq!(first_status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(second_status, StatusCode::OK);
+
+        let attempts = store.attempts.read().await;
+        assert_eq!(attempts.len(), 2);
 
         let statuses = store.statuses.read().await;
         assert_eq!(
@@ -2040,13 +2379,19 @@ mod tests {
     async fn replay_forwards_allowlisted_headers_only() {
         let (destination, received) = spawn_test_receiver().await;
         let mut destinations = HashMap::new();
-        destinations.insert("github".to_owned(), destination);
+        destinations.insert(
+            "github".to_owned(),
+            SourceConfig {
+                url: destination,
+                timeout_ms: 10_000,
+            },
+        );
 
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: destinations,
+                source_configs: destinations,
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -2117,13 +2462,19 @@ mod tests {
     async fn replay_never_forwards_hop_by_hop_headers_even_when_allowlisted() {
         let (destination, received) = spawn_test_receiver().await;
         let mut destinations = HashMap::new();
-        destinations.insert("github".to_owned(), destination);
+        destinations.insert(
+            "github".to_owned(),
+            SourceConfig {
+                url: destination,
+                timeout_ms: 10_000,
+            },
+        );
 
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: destinations,
+                source_configs: destinations,
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: vec![
@@ -2271,7 +2622,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),

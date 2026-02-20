@@ -33,7 +33,7 @@ export DATABASE_URL='postgres://webhook:webhook@localhost:5432/webhook_relay'
 export BIND_ADDR='0.0.0.0:8080'
 export ADMIN_BASIC_USER='admin'
 export ADMIN_BASIC_PASS='secret'
-export SOURCE_DESTINATIONS='{"stripe":"http://host.docker.internal:3000/"}'
+export SOURCE_CONFIGS='{"stripe":{"url":"http://host.docker.internal:3000/","timeout_ms":5000}}'
 export SOURCE_SECRETS='{"stripe":"topsecret"}'
 export REPLAY_FORWARD_HEADERS='content-type,user-agent,x-github-event,x-github-delivery,stripe-signature'
 
@@ -53,7 +53,8 @@ Required:
 
 Optional (JSON maps):
 
-- `SOURCE_DESTINATIONS` — map of source to replay destination URL.
+- `SOURCE_CONFIGS` — map of source to replay config (`url`, optional `timeout_ms`).
+- `SOURCE_DESTINATIONS` — legacy map of source to replay destination URL (used only when `SOURCE_CONFIGS` is unset; default timeout applies).
   - Example: `{"stripe":"https://example.internal/webhooks"}`
 - `SOURCE_SECRETS` — map of source to HMAC secret for ingest signature validation.
   - Example: `{"stripe":"whsec_..."}`
@@ -63,7 +64,7 @@ Optional (JSON maps):
 Notes:
 
 - If a source is missing in `SOURCE_SECRETS`, ingest for that source is accepted without signature validation.
-- Replays require a destination for the event source in `SOURCE_DESTINATIONS`.
+- Replays require a destination for the event source in `SOURCE_CONFIGS` (or `SOURCE_DESTINATIONS` for legacy config).
 
 ## curl ingest example
 
