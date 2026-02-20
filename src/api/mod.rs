@@ -140,7 +140,7 @@ struct IngestResponse {
     received_at: OffsetDateTime,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct NewEvent {
     id: Uuid,
     source: String,
@@ -871,14 +871,33 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MemoryStore {
-        events: Arc<RwLock<Vec<NewEvent>>>,
+        events: Arc<RwLock<Vec<StoredMemoryEvent>>>,
         attempts: Arc<RwLock<Vec<NewDeliveryAttempt>>>,
         statuses: Arc<RwLock<HashMap<Uuid, EventStatus>>>,
+    }
+
+    #[derive(Clone)]
+    struct StoredMemoryEvent {
+        event: NewEvent,
+        received_at: OffsetDateTime,
     }
 
     #[axum::async_trait]
     impl EventStore for MemoryStore {
         async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError> {
+            let received_at = OffsetDateTime::now_utc();
+            self.events.write().await.push(StoredMemoryEvent {
+                received_at,
+                event: NewEvent {
+                    id: event.id,
+                    source: event.source.clone(),
+                    method: event.method,
+                    path: event.path,
+                    query: event.query,
+                    headers: event.headers,
+                    body: event.body,
+                    content_type: event.content_type,
+                },
             self.events.write().await.push(NewEvent {
                 id: event.id,
                 source: event.source.clone(),
@@ -894,7 +913,7 @@ mod tests {
             Ok(StoredEvent {
                 id: event.id,
                 source: event.source,
-                received_at: OffsetDateTime::now_utc(),
+                received_at,
             })
         }
 
@@ -908,10 +927,14 @@ mod tests {
                 .await
                 .iter()
                 .filter(|event| match &filters.source {
-                    Some(source) => &event.source == source,
+                    Some(source) => &event.event.source == source,
                     None => true,
                 })
                 .map(|event| ListedEvent {
+                    id: event.event.id,
+                    source: event.event.source.clone(),
+                    status: "received".to_owned(),
+                    received_at: event.received_at,
                     id: event.id,
                     source: event.source.clone(),
                     status: EventStatus::Received,
@@ -965,13 +988,13 @@ mod tests {
                 .read()
                 .await
                 .iter()
-                .find(|event| event.id == id)
+                .find(|event| event.event.id == id)
                 .map(|event| ReplayEvent {
-                    id: event.id,
-                    source: event.source.clone(),
-                    method: event.method.clone(),
-                    body: event.body.clone(),
-                    content_type: event.content_type.clone(),
+                    id: event.event.id,
+                    source: event.event.source.clone(),
+                    method: event.event.method.clone(),
+                    body: event.event.body.clone(),
+                    content_type: event.event.content_type.clone(),
                 });
 
             Ok(event)
@@ -1134,6 +1157,11 @@ mod tests {
 
         let stored = store.events.read().await;
         assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].event.source, "stripe");
+        assert_eq!(stored[0].event.method, "POST");
+        assert_eq!(stored[0].event.path, "/hooks/stripe");
+        assert_eq!(stored[0].event.query.as_deref(), Some("attempt=1"));
+        assert_eq!(stored[0].event.body, payload);
         assert_eq!(stored[0].source, "stripe");
         assert_eq!(stored[0].method, "POST");
         assert_eq!(stored[0].path, "/hooks/stripe");
@@ -1142,6 +1170,7 @@ mod tests {
         assert_eq!(stored[0].body_size_bytes as usize, stored[0].body.len());
 
         let sig_headers = stored[0]
+            .event
             .headers
             .get("x-signature")
             .and_then(Value::as_array)
@@ -1182,6 +1211,8 @@ mod tests {
 
         let stored = store.events.read().await;
         assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].event.source, "github");
+        assert_eq!(stored[0].event.body, payload);
         assert_eq!(stored[0].source, "github");
         assert_eq!(stored[0].body, payload);
         assert_eq!(stored[0].body_size_bytes as usize, stored[0].body.len());
@@ -1655,6 +1686,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_pagination_is_stable_across_cursor_pages() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        for source in ["one", "two", "three"] {
+            let _ = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/hooks/{source}").as_str())
+                        .body(Body::from("{}"))
+                        .expect("valid request"),
+                )
+                .await
+                .expect("request should succeed");
+        }
+
+        let page_1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/events?limit=2")
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(page_1.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(page_1.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+        let first_page_items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items should be an array");
+        assert_eq!(first_page_items.len(), 2);
+
+        let cursor = payload
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .expect("next cursor should exist")
+            .to_owned();
+
+        let page_2 = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/events?limit=2&cursor={cursor}").as_str())
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(page_2.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(page_2.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+        let second_page_items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items should be an array");
+        assert_eq!(second_page_items.len(), 1);
+
+        let first_page_ids = first_page_items
+            .iter()
+            .map(|item| item.get("id").and_then(Value::as_str).unwrap_or_default())
+            .collect::<Vec<_>>();
+
+        let second_page_ids = second_page_items
+            .iter()
+            .map(|item| item.get("id").and_then(Value::as_str).unwrap_or_default())
+            .collect::<Vec<_>>();
+
+        assert!(
+            second_page_ids
+                .iter()
+                .all(|id| !first_page_ids.iter().any(|first| first == id)),
+            "cursor pagination should not repeat ids across pages"
+        );
+    }
+
+    #[tokio::test]
     async fn replay_forwards_exact_body_and_content_type() {
         let (destination, received) = spawn_test_receiver().await;
         let mut destinations = HashMap::new();
@@ -1690,7 +1822,7 @@ mod tests {
 
         assert_eq!(ingest_response.status(), StatusCode::CREATED);
 
-        let event_id = store.events.read().await[0].id;
+        let event_id = store.events.read().await[0].event.id;
         let replay_response = app
             .oneshot(
                 Request::builder()
@@ -1773,6 +1905,6 @@ mod tests {
 
         let events = store.events.read().await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].query.as_deref(), Some("attempt=2&foo=bar"));
+        assert_eq!(events[0].event.query.as_deref(), Some("attempt=2&foo=bar"));
     }
 }
