@@ -7,7 +7,7 @@ use subtle::ConstantTimeEq;
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -67,7 +67,32 @@ fn router_with_state(
         .route("/healthz", get(healthz))
         .route("/hooks/:source", post(ingest_hook))
         .merge(events_routes)
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
+}
+
+#[derive(Clone, Debug)]
+struct RequestId(String);
+
+async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get("X-Request-Id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
+
+    let mut response = next.run(request).await;
+    if let Ok(header_value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("X-Request-Id", header_value);
+    }
+
+    response
 }
 
 #[derive(Clone)]
@@ -269,6 +294,7 @@ struct ReplayResponse {
 
 async fn replay_event(
     State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let event = state
@@ -279,6 +305,8 @@ async fn replay_event(
             status: StatusCode::NOT_FOUND,
             message: format!("event not found: {id}"),
         })?;
+
+    tracing::info!(request_id = %request_id.0, event_id = %event.id, "replaying event");
 
     let destination = state
         .source_destinations
@@ -364,6 +392,8 @@ async fn replay_event(
 
     state.store.create_delivery_attempt(attempt).await?;
     state.store.update_event_status(event.id, status).await?;
+
+    tracing::info!(request_id = %request_id.0, event_id = %event.id, status, "replay finished");
 
     Ok((
         StatusCode::OK,
@@ -452,6 +482,7 @@ fn encode_cursor(event: &ListedEvent) -> String {
 
 async fn events_index(
     State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
     Query(query): Query<EventListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let filters = query.into_filters()?;
@@ -465,6 +496,8 @@ async fn events_index(
     } else {
         None
     };
+
+    tracing::info!(request_id = %request_id.0, event_count = items.len(), "events listed");
 
     Ok(Json(EventListResponse { items, next_cursor }))
 }
@@ -623,6 +656,7 @@ fn validate_source_signature(
 
 async fn ingest_hook(
     State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
     Path(source): Path<String>,
     method: Method,
     headers: HeaderMap,
@@ -652,6 +686,8 @@ async fn ingest_hook(
     };
 
     let stored = state.store.create_event(event).await?;
+
+    tracing::info!(request_id = %request_id.0, event_id = %stored.id, source = %stored.source, "event ingested");
 
     let response = IngestResponse {
         id: stored.id,
@@ -911,6 +947,69 @@ mod tests {
         });
 
         (format!("http://{addr}/"), rx)
+    }
+
+    #[tokio::test]
+    async fn response_includes_generated_request_id_when_missing() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                http_client: Client::new(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert!(response.headers().contains_key("X-Request-Id"));
+    }
+
+    #[tokio::test]
+    async fn response_echoes_request_id_header() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                http_client: Client::new(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .header("X-Request-Id", "req-123")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("X-Request-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("req-123")
+        );
     }
 
     #[tokio::test]
