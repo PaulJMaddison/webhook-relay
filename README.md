@@ -105,6 +105,17 @@ Replay uses the event's original method/body and forwards with:
 - A safe allowlist of original headers (default: `content-type`, `user-agent`, `x-github-event`, `x-github-delivery`, `stripe-signature`, configurable via `REPLAY_FORWARD_HEADERS`).
 - Hop-by-hop headers are always stripped (`connection`, `keep-alive`, `transfer-encoding`, etc.), even if allowlisted.
 
+
+## Recommended database indexes
+
+The event listing endpoint (`GET /events`) uses cursor pagination ordered by
+`received_at DESC, id DESC`. The following indexes are recommended and are
+already created by migrations:
+
+- `events_received_at_id_desc_idx` on `(received_at DESC, id DESC)`
+- `events_source_received_at_idx` on `(source, received_at DESC)`
+- `events_status_received_at_idx` on `(status, received_at DESC)`
+
 ## Security notes
 
 - Protect admin endpoints with strong credentials and TLS in production.
