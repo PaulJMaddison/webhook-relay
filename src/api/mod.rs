@@ -1,6 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
+use hmac::{Hmac, Mac};
 use reqwest::Client;
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use axum::{
     body::Bytes,
@@ -23,10 +26,12 @@ pub fn router(
     admin_basic_user: String,
     admin_basic_pass: String,
     source_destinations: HashMap<String, String>,
+    source_secrets: HashMap<String, String>,
 ) -> Router {
     let state = AppState {
         store: Arc::new(PgEventStore { pool }),
         source_destinations,
+        source_secrets,
         http_client: Client::new(),
     };
 
@@ -51,8 +56,6 @@ fn router_with_state(
 
     let events_routes = Router::new()
         .route("/events", get(events_index))
-        .route("/events/:id/replay", post(replay_event))
-        .route("/events/:id", get(events_index))
         .route("/events/:id", get(events_index))
         .route("/events/:id/replay", post(replay_event))
         .layer(middleware::from_fn_with_state(
@@ -71,6 +74,7 @@ fn router_with_state(
 struct AppState {
     store: Arc<dyn EventStore>,
     source_destinations: HashMap<String, String>,
+    source_secrets: HashMap<String, String>,
     http_client: Client,
 }
 
@@ -141,7 +145,6 @@ trait EventStore: Send + Sync {
     async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError>;
     async fn create_delivery_attempt(&self, attempt: NewDeliveryAttempt) -> Result<(), AppError>;
     async fn update_event_status(&self, event_id: Uuid, status: &str) -> Result<(), AppError>;
-    async fn get_event(&self, id: Uuid) -> Result<Option<NewEvent>, AppError>;
 }
 
 #[axum::async_trait]
@@ -202,10 +205,6 @@ impl EventStore for PgEventStore {
         let event = sqlx::query_as::<_, ReplayEvent>(
             r#"
             SELECT id, source, method, body, content_type
-    async fn get_event(&self, id: Uuid) -> Result<Option<NewEvent>, AppError> {
-        let event = sqlx::query_as::<_, NewEvent>(
-            r#"
-            SELECT id, source, method, path, query, headers, body, content_type
             FROM events
             WHERE id = $1
             "#,
@@ -277,6 +276,7 @@ async fn replay_event(
         .load_event_for_replay(id)
         .await?
         .ok_or_else(|| AppError {
+            status: StatusCode::NOT_FOUND,
             message: format!("event not found: {id}"),
         })?;
 
@@ -285,6 +285,7 @@ async fn replay_event(
         .get(&event.source)
         .cloned()
         .ok_or_else(|| AppError {
+            status: StatusCode::BAD_REQUEST,
             message: format!("no destination configured for source: {}", event.source),
         })?;
 
@@ -293,6 +294,7 @@ async fn replay_event(
         .no_proxy()
         .build()
         .map_err(|err| AppError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: err.to_string(),
         })?;
 
@@ -301,6 +303,7 @@ async fn replay_event(
         .method
         .parse::<reqwest::Method>()
         .map_err(|err| AppError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: err.to_string(),
         })?;
 
@@ -323,6 +326,7 @@ async fn replay_event(
                 .await
                 .map(|bytes| bytes.to_vec())
                 .map_err(|err| AppError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
                     message: err.to_string(),
                 })?;
             let status = if response_status >= 200 && response_status < 300 {
@@ -570,6 +574,53 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
+fn parse_signature_header(value: &str) -> Option<Vec<u8>> {
+    let signature = value.strip_prefix("sha256=")?;
+    hex::decode(signature).ok()
+}
+
+fn verify_signature(secret: &str, body: &[u8], signature: &[u8]) -> bool {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts arbitrary key lengths");
+    mac.update(body);
+    let expected = mac.finalize().into_bytes();
+
+    if expected.len() != signature.len() {
+        return false;
+    }
+
+    expected.ct_eq(signature).into()
+}
+
+fn validate_source_signature(
+    source: &str,
+    source_secrets: &HashMap<String, String>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), AppError> {
+    let Some(secret) = source_secrets.get(source) else {
+        return Ok(());
+    };
+
+    let provided = headers
+        .get("X-Signature")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_signature_header)
+        .ok_or_else(|| AppError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "invalid signature".to_owned(),
+        })?;
+
+    if verify_signature(secret, body, &provided) {
+        Ok(())
+    } else {
+        Err(AppError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "invalid signature".to_owned(),
+        })
+    }
+}
+
 async fn ingest_hook(
     State(state): State<AppState>,
     Path(source): Path<String>,
@@ -579,6 +630,8 @@ async fn ingest_hook(
     uri: Uri,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
+    validate_source_signature(&source, &state.source_secrets, &headers, &body)?;
+
     let event_id = Uuid::new_v4();
     let path = uri.path().to_owned();
     let query = uri.query().map(ToOwned::to_owned);
@@ -615,65 +668,6 @@ async fn ingest_hook(
     Ok((StatusCode::CREATED, response_headers, Json(response)))
 }
 
-#[derive(Debug, Serialize)]
-struct ReplayResponse {
-    event_id: Uuid,
-    destination: String,
-    status: u16,
-}
-
-async fn replay_event(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, AppError> {
-    let event = state.store.get_event(id).await?.ok_or_else(|| AppError {
-        status: StatusCode::NOT_FOUND,
-        message: "event not found".to_owned(),
-    })?;
-
-    let destination = state
-        .source_destinations
-        .get(&event.source)
-        .cloned()
-        .ok_or_else(|| {
-            AppError::bad_request(format!("missing destination for source '{}'", event.source))
-        })?;
-
-    let target = build_target_url(&destination, &event.path, event.query.as_deref());
-    let mut request = state
-        .http_client
-        .request(
-            reqwest::Method::from_bytes(event.method.as_bytes())
-                .map_err(|err| AppError::internal(err.to_string()))?,
-            &target,
-        )
-        .body(event.body);
-
-    if let Some(content_type) = &event.content_type {
-        request = request.header(header::CONTENT_TYPE.as_str(), content_type);
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|err| AppError::internal(err.to_string()))?;
-
-    Ok(Json(ReplayResponse {
-        event_id: id,
-        destination: target,
-        status: response.status().as_u16(),
-    }))
-}
-
-fn build_target_url(base: &str, path: &str, query: Option<&str>) -> String {
-    let mut url = format!("{}{}", base.trim_end_matches('/'), path);
-    if let Some(query) = query {
-        url.push('?');
-        url.push_str(query);
-    }
-    url
-}
-
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for name in headers.keys() {
@@ -702,6 +696,8 @@ fn headers_to_json_value(headers: &reqwest::header::HeaderMap) -> serde_json::Va
     }
 
     serde_json::Value::Object(out)
+}
+
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for NewEvent {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
@@ -846,7 +842,6 @@ mod tests {
         }
 
         async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError> {
-        async fn get_event(&self, id: Uuid) -> Result<Option<NewEvent>, AppError> {
             let event = self
                 .events
                 .read()
@@ -857,13 +852,6 @@ mod tests {
                     id: event.id,
                     source: event.source.clone(),
                     method: event.method.clone(),
-                .map(|event| NewEvent {
-                    id: event.id,
-                    source: event.source.clone(),
-                    method: event.method.clone(),
-                    path: event.path.clone(),
-                    query: event.query.clone(),
-                    headers: event.headers.clone(),
                     body: event.body.clone(),
                     content_type: event.content_type.clone(),
                 });
@@ -932,6 +920,7 @@ mod tests {
             AppState {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
                 http_client: Client::new(),
             },
             "admin".to_owned(),
@@ -978,6 +967,7 @@ mod tests {
             AppState {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
                 http_client: Client::new(),
             },
             "admin".to_owned(),
@@ -1012,6 +1002,7 @@ mod tests {
             AppState {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
                 http_client: Client::new(),
             },
             "admin".to_owned(),
@@ -1046,6 +1037,7 @@ mod tests {
             AppState {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
                 http_client: Client::new(),
             },
             "admin".to_owned(),
@@ -1067,12 +1059,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_requires_signature_when_source_secret_present() {
+        let store = MemoryStore::default();
+        let mut source_secrets = HashMap::new();
+        source_secrets.insert("stripe".to_owned(), "topsecret".to_owned());
+
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store),
+                source_destinations: HashMap::new(),
+                source_secrets,
+                http_client: Client::new(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ingest_accepts_valid_signature_when_source_secret_present() {
+        let store = MemoryStore::default();
+        let mut source_secrets = HashMap::new();
+        source_secrets.insert("stripe".to_owned(), "topsecret".to_owned());
+
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store),
+                source_destinations: HashMap::new(),
+                source_secrets,
+                http_client: Client::new(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let payload = b"{}";
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"topsecret").expect("valid key");
+        mac.update(payload);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .header("X-Signature", signature)
+                    .body(Body::from(payload.to_vec()))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
     async fn events_accept_valid_basic_auth() {
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
                 http_client: Client::new(),
             },
             "admin".to_owned(),
@@ -1101,6 +1162,7 @@ mod tests {
             AppState {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
                 http_client: Client::new(),
             },
             "admin".to_owned(),
@@ -1147,6 +1209,7 @@ mod tests {
             AppState {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
                 http_client: Client::new(),
             },
             "admin".to_owned(),
@@ -1193,6 +1256,8 @@ mod tests {
             AppState {
                 store: Arc::new(store.clone()),
                 source_destinations: destinations,
+                source_secrets: HashMap::new(),
+                http_client: Client::new(),
             },
             "admin".to_owned(),
             "secret".to_owned(),

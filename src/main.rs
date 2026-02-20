@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.admin_basic_user,
         config.admin_basic_pass,
         config.source_destinations,
+        config.source_secrets,
     );
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(address = %config.bind_addr, "server listening");

@@ -63,6 +63,7 @@ curl -s -X POST http://localhost:8080/events/<event-id>/replay \
 ```bash
 export DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook_relay
 export BIND_ADDR=0.0.0.0:8080
+export SOURCE_SECRETS={"stripe":"topsecret"}
 ```
 
 3. Start service:
@@ -80,3 +81,5 @@ cargo test
 ```
 
 Tests cover core ingestion/get/replay endpoint behavior with an in-memory store.
+
+When `SOURCE_SECRETS` is configured for a source, `/hooks/{source}` requires an `X-Signature: sha256=<hex>` header computed as HMAC-SHA256 over the raw request body.
