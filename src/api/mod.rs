@@ -73,7 +73,7 @@ fn router_with_state(
 
     let events_routes = Router::new()
         .route("/events", get(events_index))
-        .route("/events/:id", get(events_index))
+        .route("/events/:id", get(event_show))
         .route("/events/:id/replay", post(replay_event))
         .layer(middleware::from_fn_with_state(
             admin_auth,
@@ -149,6 +149,7 @@ struct NewEvent {
     query: Option<String>,
     headers: serde_json::Value,
     body: Vec<u8>,
+    body_size_bytes: i32,
     content_type: Option<String>,
 }
 
@@ -188,6 +189,7 @@ struct PgEventStore {
 trait EventStore: Send + Sync {
     async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError>;
     async fn list_events(&self, filters: EventListFilters) -> Result<Vec<ListedEvent>, AppError>;
+    async fn get_event(&self, id: Uuid) -> Result<Option<ListedEvent>, AppError>;
     async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError>;
     async fn create_delivery_attempt(&self, attempt: NewDeliveryAttempt) -> Result<(), AppError>;
     async fn update_event_status(
@@ -202,8 +204,8 @@ impl EventStore for PgEventStore {
     async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError> {
         let stored = sqlx::query_as::<_, StoredEvent>(
             r#"
-            INSERT INTO events (id, source, method, path, query, headers, body, content_type)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO events (id, source, method, path, query, headers, body, body_size_bytes, content_type)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, source, received_at
             "#,
         )
@@ -214,6 +216,7 @@ impl EventStore for PgEventStore {
         .bind(event.query)
         .bind(event.headers)
         .bind(event.body)
+        .bind(event.body_size_bytes)
         .bind(event.content_type)
         .fetch_one(&self.pool)
         .await?;
@@ -224,7 +227,7 @@ impl EventStore for PgEventStore {
     async fn list_events(&self, filters: EventListFilters) -> Result<Vec<ListedEvent>, AppError> {
         let events = sqlx::query_as::<_, ListedEvent>(
             r#"
-            SELECT id, source, status, received_at
+            SELECT id, source, status, received_at, body_size_bytes
             FROM events
             WHERE ($1::text IS NULL OR source = $1)
               AND ($2::event_status IS NULL OR status = $2)
@@ -249,6 +252,21 @@ impl EventStore for PgEventStore {
         .await?;
 
         Ok(events)
+    }
+
+    async fn get_event(&self, id: Uuid) -> Result<Option<ListedEvent>, AppError> {
+        let event = sqlx::query_as::<_, ListedEvent>(
+            r#"
+            SELECT id, source, status, received_at, body_size_bytes
+            FROM events
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(event)
     }
 
     async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError> {
@@ -445,6 +463,7 @@ struct ListedEvent {
     source: String,
     status: EventStatus,
     received_at: OffsetDateTime,
+    body_size_bytes: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -514,6 +533,22 @@ async fn events_index(
     tracing::info!(request_id = %request_id.0, event_count = items.len(), "events listed");
 
     Ok(Json(EventListResponse { items, next_cursor }))
+}
+
+async fn event_show(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let item = state
+        .store
+        .get_event(id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("event not found: {id}")))?;
+
+    tracing::info!(request_id = %request_id.0, event_id = %item.id, "event fetched");
+
+    Ok(Json(item))
 }
 
 async fn basic_auth_middleware(
@@ -704,6 +739,8 @@ async fn ingest_hook(
         path,
         query,
         headers: headers_to_json(&headers),
+        body_size_bytes: i32::try_from(body.len())
+            .map_err(|_| AppError::validation("request body too large"))?,
         body: body.to_vec(),
         content_type,
     };
@@ -769,6 +806,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for NewEvent {
             query: row.try_get("query")?,
             headers: row.try_get("headers")?,
             body: row.try_get("body")?,
+            body_size_bytes: row.try_get("body_size_bytes")?,
             content_type: row.try_get("content_type")?,
         })
     }
@@ -795,6 +833,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ListedEvent {
             source: row.try_get("source")?,
             status: row.try_get("status")?,
             received_at: row.try_get("received_at")?,
+            body_size_bytes: row.try_get("body_size_bytes")?,
         })
     }
 }
@@ -848,6 +887,7 @@ mod tests {
                 query: event.query,
                 headers: event.headers,
                 body: event.body,
+                body_size_bytes: event.body_size_bytes,
                 content_type: event.content_type,
             });
 
@@ -876,6 +916,7 @@ mod tests {
                     source: event.source.clone(),
                     status: EventStatus::Received,
                     received_at: OffsetDateTime::now_utc(),
+                    body_size_bytes: event.body_size_bytes,
                 })
                 .collect::<Vec<_>>();
 
@@ -898,6 +939,24 @@ mod tests {
 
             items.truncate(usize::from(filters.limit) + 1);
             Ok(items)
+        }
+
+        async fn get_event(&self, id: Uuid) -> Result<Option<ListedEvent>, AppError> {
+            let event = self
+                .events
+                .read()
+                .await
+                .iter()
+                .find(|event| event.id == id)
+                .map(|event| ListedEvent {
+                    id: event.id,
+                    source: event.source.clone(),
+                    status: "received".to_owned(),
+                    received_at: OffsetDateTime::now_utc(),
+                    body_size_bytes: event.body_size_bytes,
+                });
+
+            Ok(event)
         }
 
         async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError> {
@@ -1080,6 +1139,7 @@ mod tests {
         assert_eq!(stored[0].path, "/hooks/stripe");
         assert_eq!(stored[0].query.as_deref(), Some("attempt=1"));
         assert_eq!(stored[0].body, payload);
+        assert_eq!(stored[0].body_size_bytes as usize, stored[0].body.len());
 
         let sig_headers = stored[0]
             .headers
@@ -1124,6 +1184,7 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].source, "github");
         assert_eq!(stored[0].body, payload);
+        assert_eq!(stored[0].body_size_bytes as usize, stored[0].body.len());
     }
 
     #[tokio::test]
@@ -1368,7 +1429,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/events/anything")
+                    .uri("/events")
                     .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
                     .body(Body::empty())
                     .expect("valid request"),
@@ -1517,6 +1578,80 @@ mod tests {
             .expect("request should succeed");
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items should be an array");
+        assert_eq!(items.len(), 1);
+        assert!(items[0]
+            .get("body_size_bytes")
+            .and_then(Value::as_i64)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn event_show_returns_body_size_bytes() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe")
+                    .body(Body::from("{\"ok\":true}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        let event_id = ingest_response
+            .headers()
+            .get("X-Event-Id")
+            .and_then(|value| value.to_str().ok())
+            .expect("event id header should exist");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/events/{event_id}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(payload.get("id").and_then(Value::as_str), Some(event_id));
+        assert_eq!(
+            payload.get("body_size_bytes").and_then(Value::as_i64),
+            Some(11)
+        );
     }
 
     #[tokio::test]
@@ -1614,11 +1749,13 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 1024,
+                max_webhook_size_bytes: 5_242_880,
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
             1024,
+            5_242_880,
         );
 
         let response = app
