@@ -19,13 +19,13 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{domain::EventStatus, errors::AppError};
+use crate::{config::SourceConfig, domain::EventStatus, errors::AppError};
 
 pub fn router(
     pool: PgPool,
     admin_basic_user: String,
     admin_basic_pass: String,
-    source_destinations: HashMap<String, String>,
+    source_configs: HashMap<String, SourceConfig>,
     source_secrets: HashMap<String, String>,
     max_webhook_size_bytes: usize,
     replay_forward_headers: Vec<String>,
@@ -34,7 +34,7 @@ pub fn router(
 
     let state = AppState {
         store: Arc::new(PgEventStore { pool }),
-        source_destinations,
+        source_configs,
         source_secrets,
         max_webhook_size_bytes,
         replay_forward_headers,
@@ -120,7 +120,7 @@ async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Nex
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn EventStore>,
-    source_destinations: HashMap<String, String>,
+    source_configs: HashMap<String, SourceConfig>,
     source_secrets: HashMap<String, String>,
     max_webhook_size_bytes: usize,
     replay_forward_headers: Vec<String>,
@@ -384,16 +384,14 @@ async fn replay_event(
 
     tracing::info!(request_id = %request_id.0, event_id = %event.id, "replaying event");
 
-    let destination = state
-        .source_destinations
-        .get(&event.source)
-        .cloned()
-        .ok_or_else(|| {
-            AppError::validation(format!(
-                "no destination configured for source: {}",
-                event.source
-            ))
-        })?;
+    let source_config = state.source_configs.get(&event.source).ok_or_else(|| {
+        AppError::validation(format!(
+            "no destination configured for source: {}",
+            event.source
+        ))
+    })?;
+
+    let destination = source_config.url.clone();
 
     let retries = query.retry_count()?;
     let started_at = std::time::Instant::now();
@@ -439,6 +437,7 @@ async fn replay_event(
         .request(method, destination.clone())
         .header("X-Webhook-Replay", "true")
         .header("X-Original-Event-Id", event.id.to_string())
+        .timeout(std::time::Duration::from_millis(source_config.timeout_ms))
         .header("X-Request-Id", request_id.0.clone())
         .body(event.body.clone());
 
@@ -1088,6 +1087,10 @@ mod tests {
     impl EventStore for MemoryStore {
         async fn create_event(&self, event: NewEvent) -> Result<StoredEvent, AppError> {
             let received_at = OffsetDateTime::now_utc();
+            self.events.write().await.push(StoredMemoryEvent {
+                received_at,
+                event: event.clone(),
+            });
             let id = event.id;
             let source = event.source.clone();
             let event_id = event.id;
@@ -1123,6 +1126,9 @@ mod tests {
                 .map(|event| ListedEvent {
                     id: event.event.id,
                     source: event.event.source.clone(),
+                    status: EventStatus::Received,
+                    received_at: event.received_at,
+                    body_size_bytes: event.event.body_size_bytes,
                     status: statuses
                         .get(&event.event.id)
                         .copied()
@@ -1176,6 +1182,9 @@ mod tests {
                 .map(|event| ListedEvent {
                     id: event.event.id,
                     source: event.event.source.clone(),
+                    status: EventStatus::Received,
+                    received_at: event.received_at,
+                    body_size_bytes: event.event.body_size_bytes,
                     status: statuses
                         .get(&event.event.id)
                         .copied()
@@ -1327,7 +1336,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1358,7 +1367,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1396,7 +1405,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1456,7 +1465,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1500,7 +1509,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 8,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1532,7 +1541,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 8,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1585,7 +1594,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1623,7 +1632,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1657,7 +1666,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets,
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1691,7 +1700,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets,
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1728,7 +1737,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1760,7 +1769,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1811,7 +1820,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1858,7 +1867,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1919,7 +1928,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -1979,7 +1988,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -2079,13 +2088,19 @@ mod tests {
     async fn replay_forwards_exact_body_and_content_type() {
         let (destination, received) = spawn_test_receiver().await;
         let mut destinations = HashMap::new();
-        destinations.insert("stripe".to_owned(), destination);
+        destinations.insert(
+            "stripe".to_owned(),
+            SourceConfig {
+                url: destination,
+                timeout_ms: 10_000,
+            },
+        );
 
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: destinations,
+                source_configs: destinations,
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -2267,13 +2282,19 @@ mod tests {
     async fn replay_forwards_allowlisted_headers_only() {
         let (destination, received) = spawn_test_receiver().await;
         let mut destinations = HashMap::new();
-        destinations.insert("github".to_owned(), destination);
+        destinations.insert(
+            "github".to_owned(),
+            SourceConfig {
+                url: destination,
+                timeout_ms: 10_000,
+            },
+        );
 
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: destinations,
+                source_configs: destinations,
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: default_replay_forward_headers(),
@@ -2344,13 +2365,19 @@ mod tests {
     async fn replay_never_forwards_hop_by_hop_headers_even_when_allowlisted() {
         let (destination, received) = spawn_test_receiver().await;
         let mut destinations = HashMap::new();
-        destinations.insert("github".to_owned(), destination);
+        destinations.insert(
+            "github".to_owned(),
+            SourceConfig {
+                url: destination,
+                timeout_ms: 10_000,
+            },
+        );
 
         let store = MemoryStore::default();
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: destinations,
+                source_configs: destinations,
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
                 replay_forward_headers: vec![
@@ -2415,7 +2442,7 @@ mod tests {
         let app = router_with_state(
             AppState {
                 store: Arc::new(store.clone()),
-                source_destinations: HashMap::new(),
+                source_configs: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 1024,
                 replay_forward_headers: default_replay_forward_headers(),
