@@ -28,11 +28,14 @@ pub fn router(
     source_secrets: HashMap<String, String>,
     max_webhook_size_bytes: usize,
 ) -> Router {
+    let http_client = build_http_client();
+
     let state = AppState {
         store: Arc::new(PgEventStore { pool }),
         source_destinations,
         source_secrets,
         max_webhook_size_bytes,
+        http_client,
     };
 
     router_with_state(
@@ -49,6 +52,13 @@ struct AdminAuthConfig {
     pass: String,
 }
 
+fn build_http_client() -> Client {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .no_proxy()
+        .build()
+        .expect("http client should build")
+}
 fn router_with_state(
     state: AppState,
     admin_basic_user: String,
@@ -337,7 +347,8 @@ async fn replay_event(
         .parse::<reqwest::Method>()
         .map_err(|err| AppError::internal(err.to_string()))?;
 
-    let mut request = client
+    let mut request = state
+        .http_client
         .request(method, destination.clone())
         .header("X-Webhook-Replay", "true")
         .header("X-Original-Event-Id", event.id.to_string())
@@ -654,7 +665,6 @@ async fn ingest_hook(
     Path(source): Path<String>,
     method: Method,
     headers: HeaderMap,
-    Query(_query): Query<HashMap<String, String>>,
     uri: Uri,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -967,6 +977,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -996,6 +1007,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1032,6 +1044,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1080,6 +1093,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1197,6 +1211,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1233,6 +1248,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1265,6 +1281,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets,
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1297,6 +1314,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets,
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1332,6 +1350,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1362,6 +1381,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1455,6 +1475,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1503,6 +1524,7 @@ mod tests {
                 source_destinations: destinations,
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                http_client: build_http_client(),
             },
             "admin".to_owned(),
             "secret".to_owned(),
@@ -1573,5 +1595,37 @@ mod tests {
             statuses.get(&event_id).map(String::as_str),
             Some("delivered")
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_persists_uri_query_string() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/stripe?attempt=2&foo=bar")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let events = store.events.read().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].query.as_deref(), Some("attempt=2&foo=bar"));
     }
 }
