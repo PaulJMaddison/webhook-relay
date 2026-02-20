@@ -1,85 +1,117 @@
 # webhook-relay
 
-`webhook-relay` is a Rust webhook ingestion and replay gateway.
+`webhook-relay` is a Rust service that accepts incoming webhooks, stores the raw request payload, and lets operators replay captured events to preconfigured downstream destinations.
 
-## Features (MVP)
+## What it does
 
-- `POST /hooks/{source}`: ingest webhook requests.
-- `GET /events`: list stored events.
-- `GET /events/{id}`: fetch event details.
-- `POST /events/{id}/replay`: replay a stored event to a downstream URL.
+- Ingests webhook calls via `POST /hooks/:source`.
+- Persists event metadata and raw bytes in PostgreSQL.
+- Lists events with filtering/pagination via `GET /events` (admin-auth protected).
+- Replays an event to a configured destination via `POST /events/:id/replay` (admin-auth protected).
+- Tracks replay outcomes (`delivered` / `failed`) and delivery attempts.
 
-Data persisted per event:
+## Quickstart
 
-- source
-- HTTP method/path/query
-- headers
-- raw body bytes (`BYTEA`) exactly as received
-- creation timestamp
-
-## Quickstart (Docker)
+### 1) Start with Docker Compose
 
 ```bash
 docker compose up --build
 ```
 
-API will be available at `http://localhost:8080`.
+Service listens on `http://localhost:8080` by default.
 
-### Example flow
-
-Ingest:
+### 2) Health check
 
 ```bash
-curl -i -X POST "http://localhost:8080/hooks/stripe?attempt=1" \
-  -H "content-type: application/json" \
-  -d '{"type":"invoice.paid"}'
+curl -s http://localhost:8080/healthz
 ```
 
-List events:
+### 3) Local run (without Docker)
 
 ```bash
-curl -s http://localhost:8080/events | jq .
-```
+export DATABASE_URL='postgres://webhook:webhook@localhost:5432/webhook_relay'
+export BIND_ADDR='0.0.0.0:8080'
+export ADMIN_BASIC_USER='admin'
+export ADMIN_BASIC_PASS='secret'
+export SOURCE_DESTINATIONS='{"stripe":"http://host.docker.internal:3000/"}'
+export SOURCE_SECRETS='{"stripe":"topsecret"}'
 
-Get one event:
-
-```bash
-curl -s http://localhost:8080/events/<event-id> | jq .
-```
-
-Replay:
-
-```bash
-curl -s -X POST http://localhost:8080/events/<event-id>/replay \
-  -H "content-type: application/json" \
-  -d '{"target_url":"http://host.docker.internal:3000"}' | jq .
-```
-
-## Local dev (without Docker)
-
-1. Run PostgreSQL and create a database.
-2. Set env vars:
-
-```bash
-export DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook_relay
-export BIND_ADDR=0.0.0.0:8080
-export SOURCE_SECRETS={"stripe":"topsecret"}
-```
-
-3. Start service:
-
-```bash
 cargo run
 ```
 
-Migrations are applied automatically at startup.
+Migrations are applied automatically on startup.
 
-## Testing
+## Env vars
+
+Required:
+
+- `DATABASE_URL` — PostgreSQL DSN.
+- `BIND_ADDR` — bind address (`host:port`).
+- `ADMIN_BASIC_USER` — username for `/events*` and replay endpoints.
+- `ADMIN_BASIC_PASS` — password for `/events*` and replay endpoints.
+
+Optional (JSON maps):
+
+- `SOURCE_DESTINATIONS` — map of source to replay destination URL.
+  - Example: `{"stripe":"https://example.internal/webhooks"}`
+- `SOURCE_SECRETS` — map of source to HMAC secret for ingest signature validation.
+  - Example: `{"stripe":"whsec_..."}`
+
+Notes:
+
+- If a source is missing in `SOURCE_SECRETS`, ingest for that source is accepted without signature validation.
+- Replays require a destination for the event source in `SOURCE_DESTINATIONS`.
+
+## curl ingest example
+
+If a secret exists for `stripe`, compute and send `X-Signature: sha256=<hex>` over the **raw body**:
 
 ```bash
-cargo test
+body='{"type":"invoice.paid"}'
+sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac 'topsecret' -hex | sed 's/^.* //')
+
+curl -i -X POST 'http://localhost:8080/hooks/stripe?attempt=1' \
+  -H 'content-type: application/json' \
+  -H "X-Signature: sha256=$sig" \
+  --data "$body"
 ```
 
-Tests cover core ingestion/get/replay endpoint behavior with an in-memory store.
+If no secret is configured for the source, omit `X-Signature`.
 
-When `SOURCE_SECRETS` is configured for a source, `/hooks/{source}` requires an `X-Signature: sha256=<hex>` header computed as HMAC-SHA256 over the raw request body.
+## curl replay example
+
+1) List events (admin basic auth):
+
+```bash
+curl -s -u admin:secret 'http://localhost:8080/events?source=stripe&limit=1' | jq .
+```
+
+2) Replay one event by id:
+
+```bash
+EVENT_ID='<event-uuid>'
+
+curl -i -X POST -u admin:secret \
+  "http://localhost:8080/events/$EVENT_ID/replay"
+```
+
+Replay uses the event's original method/body and forwards with:
+
+- `X-Webhook-Replay: true`
+- `X-Original-Event-Id: <event-id>`
+
+## Security notes
+
+- Protect admin endpoints with strong credentials and TLS in production.
+- Use per-source secrets in `SOURCE_SECRETS` to verify ingest authenticity.
+- Signature validation is HMAC-SHA256 over raw bytes with `X-Signature: sha256=<hex>`.
+- Replay destinations are server-side configured (not user-supplied per request), reducing open-relay risk.
+- Preserve and pass `X-Request-Id` for traceability (auto-generated if absent).
+
+## Roadmap
+
+- Retry policies and dead-letter queues for failed replays.
+- Per-source rate limits and ingest quotas.
+- Event retention policies and cleanup jobs.
+- Richer admin querying (status/time/source dashboards).
+- Optional redaction/encryption controls for sensitive payload fields.

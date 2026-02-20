@@ -47,6 +47,6 @@ impl EventStore for MemoryEventStore {
             .find(|event| event.id == id)
             .cloned();
 
-        maybe.ok_or(AppError::NotFound)
+        maybe.ok_or_else(|| AppError::not_found(format!("event not found: {id}")))
     }
 }
