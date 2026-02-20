@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(
         bind_addr = %config.bind_addr,
-        source_destination_count = config.source_destinations.len(),
+        source_config_count = config.source_configs.len(),
         "starting webhook-relay"
     );
 
@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         config.admin_basic_user,
         config.admin_basic_pass,
-        config.source_destinations,
+        config.source_configs,
         config.source_secrets,
         config.max_webhook_size_bytes,
         config.replay_forward_headers,
