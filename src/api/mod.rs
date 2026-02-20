@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, error::Error as _, sync::Arc};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -6,7 +6,7 @@ use subtle::ConstantTimeEq;
 
 use axum::{
     body::Bytes,
-    extract::{Extension, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -26,14 +26,21 @@ pub fn router(
     admin_basic_pass: String,
     source_destinations: HashMap<String, String>,
     source_secrets: HashMap<String, String>,
+    max_webhook_size_bytes: usize,
 ) -> Router {
     let state = AppState {
         store: Arc::new(PgEventStore { pool }),
         source_destinations,
         source_secrets,
+        max_webhook_size_bytes,
     };
 
-    router_with_state(state, admin_basic_user, admin_basic_pass)
+    router_with_state(
+        state,
+        admin_basic_user,
+        admin_basic_pass,
+        max_webhook_size_bytes,
+    )
 }
 
 #[derive(Clone)]
@@ -46,6 +53,7 @@ fn router_with_state(
     state: AppState,
     admin_basic_user: String,
     admin_basic_pass: String,
+    max_webhook_size_bytes: usize,
 ) -> Router {
     let admin_auth = AdminAuthConfig {
         user: admin_basic_user,
@@ -63,7 +71,10 @@ fn router_with_state(
 
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/hooks/:source", post(ingest_hook))
+        .route(
+            "/hooks/:source",
+            post(ingest_hook).layer(DefaultBodyLimit::max(max_webhook_size_bytes)),
+        )
         .merge(events_routes)
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
@@ -98,6 +109,7 @@ struct AppState {
     store: Arc<dyn EventStore>,
     source_destinations: HashMap<String, String>,
     source_secrets: HashMap<String, String>,
+    max_webhook_size_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -343,11 +355,6 @@ async fn replay_event(
                 .bytes()
                 .await
                 .map(|bytes| bytes.to_vec())
-                .map_err(|err| AppError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: err.to_string(),
-                })?;
-            let status = if (200..300).contains(&response_status) {
                 .map_err(|err| AppError::upstream(err.to_string()))?;
             let status = if response_status >= 200 && response_status < 300 {
                 "delivered"
@@ -649,8 +656,23 @@ async fn ingest_hook(
     headers: HeaderMap,
     Query(_query): Query<HashMap<String, String>>,
     uri: Uri,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<impl IntoResponse, AppError> {
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE
+            || rejection
+                .source()
+                .and_then(|source| source.downcast_ref::<http_body_util::LengthLimitError>())
+                .is_some()
+        {
+            AppError::payload_too_large("request body too large").with_details(
+                serde_json::json!({"max_webhook_size_bytes": state.max_webhook_size_bytes}),
+            )
+        } else {
+            AppError::validation(rejection.to_string())
+        }
+    })?;
+
     validate_source_signature(&source, &state.source_secrets, &headers, &body)?;
 
     let event_id = Uuid::new_v4();
@@ -944,9 +966,11 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let response = app
@@ -971,9 +995,11 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let response = app
@@ -1005,9 +1031,11 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let payload = br#"{"type":"invoice.paid"}"#.to_vec();
@@ -1051,9 +1079,11 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let payload = vec![0x00, 0x01, 0x02, 0xFF, 0x7F, 0x80, 0x10];
@@ -1078,6 +1108,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_with_body_under_limit_succeeds() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 8,
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            8,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/source")
+                    .body(Body::from("12345678"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(store.events.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_with_body_over_limit_returns_413_error() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: HashMap::new(),
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 8,
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            8,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/source")
+                    .body(Body::from("123456789"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(store.events.read().await.len(), 0);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid json");
+
+        assert_eq!(
+            payload.get("code"),
+            Some(&Value::String("payload_too_large".to_owned()))
+        );
+        assert_eq!(
+            payload.get("message"),
+            Some(&Value::String("request body too large".to_owned()))
+        );
+        assert_eq!(
+            payload
+                .get("details")
+                .and_then(Value::as_object)
+                .and_then(|d| d.get("max_webhook_size_bytes")),
+            Some(&Value::Number(8_u64.into()))
+        );
+    }
+
+    #[tokio::test]
     async fn events_require_basic_auth() {
         let store = MemoryStore::default();
         let app = router_with_state(
@@ -1085,9 +1196,11 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let response = app
@@ -1119,9 +1232,11 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let response = app
@@ -1149,9 +1264,11 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets,
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let response = app
@@ -1179,9 +1296,11 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets,
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let payload = b"{}";
@@ -1212,9 +1331,11 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let response = app
@@ -1240,9 +1361,11 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let ingest_response = app
@@ -1286,10 +1409,11 @@ mod tests {
                 store: Arc::new(store),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
-                http_client: Client::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let response = app
@@ -1330,9 +1454,11 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         for source in ["one", "two"] {
@@ -1376,9 +1502,11 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: destinations,
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
             },
             "admin".to_owned(),
             "secret".to_owned(),
+            5_242_880,
         );
 
         let payload = br#"{"type":"invoice.paid","ok":true}"#.to_vec();

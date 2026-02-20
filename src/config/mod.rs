@@ -8,6 +8,7 @@ pub struct AppConfig {
     pub admin_basic_pass: String,
     pub source_destinations: HashMap<String, String>,
     pub source_secrets: HashMap<String, String>,
+    pub max_webhook_size_bytes: usize,
 }
 
 impl AppConfig {
@@ -26,6 +27,11 @@ impl AppConfig {
             Err(env::VarError::NotPresent) => HashMap::new(),
             Err(err) => return Err(Box::new(err)),
         };
+        let max_webhook_size_bytes = match env::var("MAX_WEBHOOK_SIZE_BYTES") {
+            Ok(raw) => raw.parse::<usize>()?,
+            Err(env::VarError::NotPresent) => 5_242_880,
+            Err(err) => return Err(Box::new(err)),
+        };
 
         Ok(Self {
             database_url,
@@ -34,6 +40,7 @@ impl AppConfig {
             admin_basic_pass,
             source_destinations,
             source_secrets,
+            max_webhook_size_bytes,
         })
     }
 }
