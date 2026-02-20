@@ -9,7 +9,16 @@ pub struct AppConfig {
     pub source_destinations: HashMap<String, String>,
     pub source_secrets: HashMap<String, String>,
     pub max_webhook_size_bytes: usize,
+    pub replay_forward_headers: Vec<String>,
 }
+
+const DEFAULT_REPLAY_FORWARD_HEADERS: [&str; 5] = [
+    "content-type",
+    "user-agent",
+    "x-github-event",
+    "x-github-delivery",
+    "stripe-signature",
+];
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
@@ -32,6 +41,19 @@ impl AppConfig {
             Err(env::VarError::NotPresent) => 5_242_880,
             Err(err) => return Err(Box::new(err)),
         };
+        let replay_forward_headers = match env::var("REPLAY_FORWARD_HEADERS") {
+            Ok(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect(),
+            Err(env::VarError::NotPresent) => DEFAULT_REPLAY_FORWARD_HEADERS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            Err(err) => return Err(Box::new(err)),
+        };
 
         Ok(Self {
             database_url,
@@ -41,6 +63,7 @@ impl AppConfig {
             source_destinations,
             source_secrets,
             max_webhook_size_bytes,
+            replay_forward_headers,
         })
     }
 }

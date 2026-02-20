@@ -28,6 +28,7 @@ pub fn router(
     source_destinations: HashMap<String, String>,
     source_secrets: HashMap<String, String>,
     max_webhook_size_bytes: usize,
+    replay_forward_headers: Vec<String>,
 ) -> Router {
     let http_client = build_http_client();
 
@@ -36,6 +37,7 @@ pub fn router(
         source_destinations,
         source_secrets,
         max_webhook_size_bytes,
+        replay_forward_headers,
         http_client,
     };
 
@@ -121,6 +123,7 @@ struct AppState {
     source_destinations: HashMap<String, String>,
     source_secrets: HashMap<String, String>,
     max_webhook_size_bytes: usize,
+    replay_forward_headers: Vec<String>,
     http_client: Client,
 }
 
@@ -165,6 +168,7 @@ struct ReplayEvent {
     id: Uuid,
     source: String,
     method: String,
+    headers: serde_json::Value,
     body: Vec<u8>,
     content_type: Option<String>,
 }
@@ -272,7 +276,7 @@ impl EventStore for PgEventStore {
     async fn load_event_for_replay(&self, id: Uuid) -> Result<Option<ReplayEvent>, AppError> {
         let event = sqlx::query_as::<_, ReplayEvent>(
             r#"
-            SELECT id, source, method, body, content_type
+            SELECT id, source, method, headers, body, content_type
             FROM events
             WHERE id = $1
             "#,
@@ -379,6 +383,9 @@ async fn replay_event(
     if let Some(content_type) = &event.content_type {
         request = request.header(reqwest::header::CONTENT_TYPE, content_type);
     }
+
+    let original_headers = json_to_headermap(&event.headers);
+    request = apply_forwarded_headers(request, &original_headers, &state.replay_forward_headers);
 
     let (status, attempt) = match request.send().await {
         Ok(response) => {
@@ -794,6 +801,100 @@ fn headers_to_json_value(headers: &reqwest::header::HeaderMap) -> serde_json::Va
     serde_json::Value::Object(out)
 }
 
+#[cfg(test)]
+fn default_replay_forward_headers() -> Vec<String> {
+    [
+        "content-type",
+        "user-agent",
+        "x-github-event",
+        "x-github-delivery",
+        "stripe-signature",
+    ]
+    .iter()
+    .map(|value| (*value).to_owned())
+    .collect()
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn json_to_headermap(headers: &serde_json::Value) -> HeaderMap {
+    let mut header_map = HeaderMap::new();
+
+    if let serde_json::Value::Object(map) = headers {
+        for (name, raw_values) in map {
+            let Ok(header_name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+
+            let values = match raw_values {
+                serde_json::Value::Array(items) => items,
+                _ => continue,
+            };
+
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    continue;
+                };
+
+                let Ok(header_value) = reqwest::header::HeaderValue::from_str(value) else {
+                    continue;
+                };
+
+                header_map.append(header_name.clone(), header_value);
+            }
+        }
+    }
+
+    header_map
+}
+
+fn apply_forwarded_headers(
+    mut request: reqwest::RequestBuilder,
+    original_headers: &HeaderMap,
+    allowlist: &[String],
+) -> reqwest::RequestBuilder {
+    for header_name in allowlist {
+        let normalized = header_name.trim().to_ascii_lowercase();
+        if normalized.is_empty() || is_hop_by_hop_header(&normalized) {
+            continue;
+        }
+
+        let Ok(source_name) = header::HeaderName::from_bytes(normalized.as_bytes()) else {
+            continue;
+        };
+
+        let values = original_headers.get_all(&source_name);
+        if values.iter().next().is_none() {
+            continue;
+        }
+
+        let Ok(target_name) = reqwest::header::HeaderName::from_bytes(normalized.as_bytes()) else {
+            continue;
+        };
+
+        for value in values.iter() {
+            let Ok(value_str) = value.to_str() else {
+                continue;
+            };
+            request = request.header(target_name.clone(), value_str);
+        }
+    }
+
+    request
+}
+
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for NewEvent {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
@@ -846,6 +947,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReplayEvent {
             id: row.try_get("id")?,
             source: row.try_get("source")?,
             method: row.try_get("method")?,
+            headers: row.try_get("headers")?,
             body: row.try_get("body")?,
             content_type: row.try_get("content_type")?,
         })
@@ -974,6 +1076,10 @@ mod tests {
                 .map(|event| ListedEvent {
                     id: event.id,
                     source: event.source.clone(),
+                    method: event.method.clone(),
+                    headers: event.headers.clone(),
+                    body: event.body.clone(),
+                    content_type: event.content_type.clone(),
                     status: "received".to_owned(),
                     received_at: OffsetDateTime::now_utc(),
                     body_size_bytes: event.body_size_bytes,
@@ -1064,6 +1170,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1094,6 +1201,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1131,6 +1239,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1187,6 +1296,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1227,6 +1337,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 8,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1258,6 +1369,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 8,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1310,6 +1422,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1347,6 +1460,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1380,6 +1494,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets,
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1413,6 +1528,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets,
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1449,6 +1565,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1480,6 +1597,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1529,6 +1647,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1575,6 +1694,7 @@ mod tests {
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1799,6 +1919,7 @@ mod tests {
                 source_destinations: destinations,
                 source_secrets: HashMap::new(),
                 max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 http_client: build_http_client(),
             },
             "admin".to_owned(),
@@ -1873,6 +1994,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_forwards_allowlisted_headers_only() {
+        let (destination, received) = spawn_test_receiver().await;
+        let mut destinations = HashMap::new();
+        destinations.insert("github".to_owned(), destination);
+
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: destinations,
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-github-event", "push")
+                    .header("x-github-delivery", "delivery-1")
+                    .header("user-agent", "GitHub-Hookshot/abc")
+                    .header("x-signature", "do-not-forward")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("ingest request should succeed");
+
+        assert_eq!(ingest_response.status(), StatusCode::CREATED);
+
+        let event_id = store.events.read().await[0].id;
+        let replay_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/events/{event_id}/replay"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("replay request should succeed");
+
+        assert_eq!(replay_response.status(), StatusCode::OK);
+
+        let (headers, _) = tokio::time::timeout(std::time::Duration::from_secs(2), received)
+            .await
+            .expect("receiver should be called")
+            .expect("receiver should capture replay");
+
+        assert_eq!(
+            headers.get("x-github-event").and_then(|v| v.to_str().ok()),
+            Some("push")
+        );
+        assert_eq!(
+            headers
+                .get("x-github-delivery")
+                .and_then(|v| v.to_str().ok()),
+            Some("delivery-1")
+        );
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("GitHub-Hookshot/abc")
+        );
+        assert!(headers.get("x-signature").is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_never_forwards_hop_by_hop_headers_even_when_allowlisted() {
+        let (destination, received) = spawn_test_receiver().await;
+        let mut destinations = HashMap::new();
+        destinations.insert("github".to_owned(), destination);
+
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+                source_destinations: destinations,
+                source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: vec![
+                    "connection".to_owned(),
+                    "x-github-delivery".to_owned(),
+                ],
+                http_client: build_http_client(),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+            5_242_880,
+        );
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/github")
+                    .header("connection", "keep-alive")
+                    .header("x-github-delivery", "delivery-2")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("ingest request should succeed");
+
+        assert_eq!(ingest_response.status(), StatusCode::CREATED);
+
+        let event_id = store.events.read().await[0].id;
+        let replay_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/events/{event_id}/replay"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("replay request should succeed");
+
+        assert_eq!(replay_response.status(), StatusCode::OK);
+
+        let (headers, _) = tokio::time::timeout(std::time::Duration::from_secs(2), received)
+            .await
+            .expect("receiver should be called")
+            .expect("receiver should capture replay");
+
+        assert!(headers.get("connection").is_none());
+        assert_eq!(
+            headers
+                .get("x-github-delivery")
+                .and_then(|v| v.to_str().ok()),
+            Some("delivery-2")
+        );
+    }
+
+    #[tokio::test]
     async fn ingest_persists_uri_query_string() {
         let store = MemoryStore::default();
         let app = router_with_state(
@@ -1880,6 +2147,8 @@ mod tests {
                 store: Arc::new(store.clone()),
                 source_destinations: HashMap::new(),
                 source_secrets: HashMap::new(),
+                max_webhook_size_bytes: 5_242_880,
+                replay_forward_headers: default_replay_forward_headers(),
                 max_webhook_size_bytes: 1024,
                 max_webhook_size_bytes: 5_242_880,
                 http_client: build_http_client(),

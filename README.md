@@ -35,6 +35,7 @@ export ADMIN_BASIC_USER='admin'
 export ADMIN_BASIC_PASS='secret'
 export SOURCE_DESTINATIONS='{"stripe":"http://host.docker.internal:3000/"}'
 export SOURCE_SECRETS='{"stripe":"topsecret"}'
+export REPLAY_FORWARD_HEADERS='content-type,user-agent,x-github-event,x-github-delivery,stripe-signature'
 
 cargo run
 ```
@@ -56,6 +57,8 @@ Optional (JSON maps):
   - Example: `{"stripe":"https://example.internal/webhooks"}`
 - `SOURCE_SECRETS` — map of source to HMAC secret for ingest signature validation.
   - Example: `{"stripe":"whsec_..."}`
+- `REPLAY_FORWARD_HEADERS` — comma-separated header names to forward from original event on replay.
+  - Default: `content-type,user-agent,x-github-event,x-github-delivery,stripe-signature`
 
 Notes:
 
@@ -99,6 +102,8 @@ Replay uses the event's original method/body and forwards with:
 
 - `X-Webhook-Replay: true`
 - `X-Original-Event-Id: <event-id>`
+- A safe allowlist of original headers (default: `content-type`, `user-agent`, `x-github-event`, `x-github-delivery`, `stripe-signature`, configurable via `REPLAY_FORWARD_HEADERS`).
+- Hop-by-hop headers are always stripped (`connection`, `keep-alive`, `transfer-encoding`, etc.), even if allowlisted.
 
 
 ## Recommended database indexes
