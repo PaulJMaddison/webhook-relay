@@ -3,8 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -15,18 +16,42 @@ use uuid::Uuid;
 
 use crate::errors::AppError;
 
-pub fn router(pool: PgPool) -> Router {
+pub fn router(pool: PgPool, admin_basic_user: String, admin_basic_pass: String) -> Router {
     let state = AppState {
         store: Arc::new(PgEventStore { pool }),
     };
 
-    router_with_state(state)
+    router_with_state(state, admin_basic_user, admin_basic_pass)
 }
 
-fn router_with_state(state: AppState) -> Router {
+#[derive(Clone)]
+struct AdminAuthConfig {
+    user: String,
+    pass: String,
+}
+
+fn router_with_state(
+    state: AppState,
+    admin_basic_user: String,
+    admin_basic_pass: String,
+) -> Router {
+    let admin_auth = AdminAuthConfig {
+        user: admin_basic_user,
+        pass: admin_basic_pass,
+    };
+
+    let events_routes = Router::new()
+        .route("/events", get(events_index))
+        .route("/events/*rest", get(events_index))
+        .layer(middleware::from_fn_with_state(
+            admin_auth,
+            basic_auth_middleware,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/hooks/:source", post(ingest_hook))
+        .merge(events_routes)
         .with_state(state)
 }
 
@@ -103,6 +128,115 @@ impl EventStore for PgEventStore {
 
         Ok(stored)
     }
+}
+
+async fn events_index() -> impl IntoResponse {
+    StatusCode::NO_CONTENT
+}
+
+async fn basic_auth_middleware(
+    State(auth): State<AdminAuthConfig>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if is_authorized(request.headers(), &auth.user, &auth.pass) {
+        return next.run(request).await;
+    }
+
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"events\""),
+    );
+    response
+}
+
+fn is_authorized(headers: &HeaderMap, expected_user: &str, expected_pass: &str) -> bool {
+    let Some(auth_header) = headers.get(header::AUTHORIZATION) else {
+        return false;
+    };
+
+    let Ok(auth_header) = auth_header.to_str() else {
+        return false;
+    };
+
+    let Some(encoded) = auth_header.strip_prefix("Basic ") else {
+        return false;
+    };
+
+    let Ok(decoded) = decode_base64(encoded) else {
+        return false;
+    };
+
+    let Ok(credentials) = String::from_utf8(decoded) else {
+        return false;
+    };
+
+    let mut parts = credentials.splitn(2, ':');
+    let Some(user) = parts.next() else {
+        return false;
+    };
+    let Some(pass) = parts.next() else {
+        return false;
+    };
+
+    user == expected_user && pass == expected_pass
+}
+
+fn decode_base64(input: &str) -> Result<Vec<u8>, ()> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return Err(());
+    }
+
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c0 = bytes[i];
+        let c1 = bytes[i + 1];
+        let c2 = bytes[i + 2];
+        let c3 = bytes[i + 3];
+
+        let v0 = val(c0).ok_or(())?;
+        let v1 = val(c1).ok_or(())?;
+
+        if c2 == b'=' {
+            if c3 != b'=' || i + 4 != bytes.len() {
+                return Err(());
+            }
+            out.push((v0 << 2) | (v1 >> 4));
+            break;
+        }
+
+        let v2 = val(c2).ok_or(())?;
+        out.push((v0 << 2) | (v1 >> 4));
+        out.push((v1 << 4) | (v2 >> 2));
+
+        if c3 == b'=' {
+            if i + 4 != bytes.len() {
+                return Err(());
+            }
+            break;
+        }
+
+        let v3 = val(c3).ok_or(())?;
+        out.push((v2 << 6) | v3);
+
+        i += 4;
+    }
+
+    Ok(out)
 }
 
 async fn ingest_hook(
@@ -226,9 +360,13 @@ mod tests {
     #[tokio::test]
     async fn ingest_json_payload_stores_exact_bytes() {
         let store = MemoryStore::default();
-        let app = router_with_state(AppState {
-            store: Arc::new(store.clone()),
-        });
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
 
         let payload = br#"{"type":"invoice.paid"}"#.to_vec();
         let response = app
@@ -266,9 +404,13 @@ mod tests {
     #[tokio::test]
     async fn ingest_binary_payload_stores_exact_bytes() {
         let store = MemoryStore::default();
-        let app = router_with_state(AppState {
-            store: Arc::new(store.clone()),
-        });
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
 
         let payload = vec![0x00, 0x01, 0x02, 0xFF, 0x7F, 0x80, 0x10];
         let response = app
@@ -289,5 +431,88 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].source, "github");
         assert_eq!(stored[0].body, payload);
+    }
+
+    #[tokio::test]
+    async fn events_require_basic_auth() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/events")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Basic realm=\"events\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn hooks_are_not_protected_by_basic_auth() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store.clone()),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/source")
+                    .body(Body::from("hello"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn events_accept_valid_basic_auth() {
+        let store = MemoryStore::default();
+        let app = router_with_state(
+            AppState {
+                store: Arc::new(store),
+            },
+            "admin".to_owned(),
+            "secret".to_owned(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/events/anything")
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }
